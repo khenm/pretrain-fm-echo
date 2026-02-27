@@ -1,0 +1,27 @@
+model: "resnet18"
+data: "dummy"
+
+training: 
+  epochs: 5
+  lr: 1e-4
+  batch_size: 128
+  train_batch_size: 256
+  val_batch_size: 128
+  num_workers: 2
+  persistent_workers: false
+  weight_decay: 1.0e-5
+  patience: 3
+  seed: 42
+  find_unused_parameters: false
+
+  # save
+  save_dir: "runs" 
+  checkpoint_dir: "checkpoints" 
+  resume_path: null 
+
+loss:
+  types: ["CrossEntropy"]
+
+wandb:
+  enable: false
+  project: "pytorch-template-test"

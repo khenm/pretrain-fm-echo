@@ -1,0 +1,5 @@
+name: "imagenet"
+root_dir: "./data/imagenet"
+img_size: 224
+subset_size: null
+# other atts below

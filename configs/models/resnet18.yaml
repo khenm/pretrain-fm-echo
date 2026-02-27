@@ -1,0 +1,5 @@
+name: "resnet18" # ensure matching name
+input_channels: 3
+num_classes: 10
+pretrained: true
+# other params below
