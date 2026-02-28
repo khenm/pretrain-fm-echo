@@ -1,0 +1,9 @@
+name: "SpatiotemporalPipeline"
+num_phases: 3
+peft:
+  enabled: true
+  rank: 8
+  alpha: 16
+  dropout: 0.05
+  target_modules: ["qkv", "proj"]
+  panecho_target_modules: ["out_proj", "in_proj_weight"]

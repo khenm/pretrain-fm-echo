@@ -44,15 +44,12 @@ def load_config(config_path: str | Path) -> Dict[str, Any]:
     elif isinstance(cfg.get('data'), dict) and 'name' in cfg['data']:
         dataset_name = cfg['data']['name']
         dataset_config_path = base_dir / 'datasets' / f"{dataset_name}.yaml"
-        if not dataset_config_path.exists():
-            raise FileNotFoundError(f"Dataset config not found at {dataset_config_path}")
-        
-        with open(dataset_config_path, 'r') as f:
-            dataset_cfg = yaml.safe_load(f)
-
-        inline_overrides = cfg['data']
-        dataset_cfg.update(inline_overrides)
-        cfg['data'] = dataset_cfg
+        if dataset_config_path.exists():
+            with open(dataset_config_path, 'r') as f:
+                dataset_cfg = yaml.safe_load(f)
+            inline_overrides = cfg['data']
+            dataset_cfg.update(inline_overrides)
+            cfg['data'] = dataset_cfg
     
     return cfg
 

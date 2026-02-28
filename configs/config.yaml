@@ -1,27 +1,39 @@
-model: "resnet18"
-data: "dummy"
+model:
+  name: "SpatiotemporalPipeline"
+  max_clip_len: 32
 
-training: 
-  epochs: 5
-  lr: 1e-4
-  batch_size: 128
-  train_batch_size: 256
-  val_batch_size: 128
-  num_workers: 2
-  persistent_workers: false
-  weight_decay: 1.0e-5
-  patience: 3
+data: 
+  name: "echonet"
+  input_key: "video"
+  target_key: "batch"
+
+training:
+  epochs: 50
+  lr: 1.0e-4
+  batch_size: 16
+  train_batch_size: 64
+  val_batch_size: 64
+  num_workers: 4
+  persistent_workers: true
+  weight_decay: 5.0e-5
+  patience: 10
   seed: 42
-  find_unused_parameters: false
-
-  # save
-  save_dir: "runs" 
-  checkpoint_dir: "checkpoints" 
-  resume_path: null 
+  find_unused_parameters: true
+  save_dir: "/workspace/runs"
+  checkpoint_dir: "/workspace/checkpoints"
+  resume_path: null
+  pretrain: true
 
 loss:
-  types: ["CrossEntropy"]
+  types: ["SpatiotemporalLoss"]
+  kwargs:
+    dice_weight: 1.0
+    volume_weight: 1.0
+    gamma: 2.0
+    focal_clip_threshold: 0.5
+    focal_scale_weight: 1.0
+    focal_ratio_weight: 1.0
+    focal_sv_weight: 1.0
 
 wandb:
   enable: false
-  project: "pytorch-template-test"
