@@ -10,7 +10,7 @@ from src.utils.logging import get_logger
 from src.runner import run_init, get_criterions, get_metrics
 from src.registry import build_model, get_dataloaders
 from src.trainer import Trainer
-from src.utils.env import TrainerState
+from src.utils.config import TrainerState
 from src.utils.dist import cleanup_dist
 import torch
 import torch.distributed as dist

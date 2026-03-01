@@ -9,6 +9,9 @@ from src.registry import register_model
 
 logger = logging.getLogger(__name__)
 
+PANECHO_NATIVE_CLIP_LEN = 16
+
+
 def load_panecho_isolated(clip_len=16):
     """Loads PanEcho bypassing torch.hub to prevent namespace collisions using importlib."""
     import sys
@@ -26,20 +29,12 @@ def load_panecho_isolated(clip_len=16):
     # ---------------------------------------------------------
 
     hub_dir = os.path.expanduser('~/.cache/torch/hub/CarDS-Yale_PanEcho_main')
-    
-    if not os.path.exists(hub_dir):
-        try:
-            torch.hub.load('CarDS-Yale/PanEcho', 'PanEcho', pretrained=False, trust_repo=True)
-        except Exception as e:
-            logger.warning(f"Failed to pre-download PanEcho: {e}")
 
-    # Aggressively remove EVERY local path that might shadow the repo's 'src'
     orig_path = list(sys.path)
     cwd = os.getcwd()
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-    
+
     sys.path = [p for p in sys.path if p and p not in (cwd, project_root, '')]
-    sys.path.insert(0, hub_dir)
 
     stashed_modules = {}
     for mod_name in list(sys.modules.keys()):
@@ -47,6 +42,17 @@ def load_panecho_isolated(clip_len=16):
             stashed_modules[mod_name] = sys.modules.pop(mod_name, None)
 
     try:
+        if not os.path.exists(hub_dir):
+            try:
+                torch.hub.load(
+                    'CarDS-Yale/PanEcho', 'PanEcho',
+                    pretrained=False, trust_repo=True,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to pre-download PanEcho: {e}")
+
+        sys.path.insert(0, hub_dir)
+
         is_distributed = dist.is_initialized()
         local_rank = int(os.environ.get('LOCAL_RANK', 0))
 
@@ -82,7 +88,8 @@ class PanEchoWrapper(nn.Module):
 
     def __init__(self, clip_len=16, peft_cfg=None):
         super().__init__()
-        self.model = load_panecho_isolated(clip_len=clip_len)
+        self.native_clip_len = PANECHO_NATIVE_CLIP_LEN
+        self.model = load_panecho_isolated(clip_len=self.native_clip_len)
         self.clip_len = clip_len
         self.feature_dim = self.model.encoder.encoder.n_features
 
@@ -120,9 +127,39 @@ class PanEchoWrapper(nn.Module):
         except ImportError:
             logger.warning("peft library not installed. Skipping LoRA for PanEcho.")
 
+    def _get_encoder(self):
+        """Resolves the encoder from the model, handling PEFT wrapping."""
+        model = self.model
+        if hasattr(model, 'base_model'):
+            model = model.base_model
+        if hasattr(model, 'model'):
+            model = model.model
+        return model.encoder
+
+    def _encode_chunk(self, frames_chunk):
+        """Encodes a single chunk of frames through PanEcho's spatial + temporal encoder.
+
+        Args:
+            frames_chunk (Tensor): (batch_size, channels, chunk_len, height, width)
+
+        Returns:
+            Tensor: Temporal features (batch_size, feature_dim, chunk_len)
+        """
+        encoder = self._get_encoder()
+        batch_size, channels, chunk_len, height, width = frames_chunk.shape
+        frames_reshaped = frames_chunk.reshape(batch_size * chunk_len, channels, height, width)
+
+        embeddings_spatial = encoder.encoder(frames_reshaped)
+        embeddings_temporal = embeddings_spatial.reshape(batch_size, chunk_len, self.feature_dim)
+        embeddings_temporal = encoder.time_encoder(embeddings_temporal)
+
+        features = encoder.transformer(embeddings_temporal)
+        return features.permute(0, 2, 1)
+
     def forward(self, frames):
         """
         Extracts spatiotemporal sequences from video frames.
+        Handles input lengths > native_clip_len by processing in chunks.
 
         Args:
             frames (Tensor): Video frames (batch_size, channels, time, height, width)
@@ -130,15 +167,30 @@ class PanEchoWrapper(nn.Module):
         Returns:
             Tensor: Spatiotemporal features (batch_size, feature_dim, time, 1, 1)
         """
-        batch_size, channels, length, height, width = frames.shape
-        frames_reshaped = frames.reshape(batch_size * length, channels, height, width)
+        total_len = frames.shape[2]
+        n = self.native_clip_len
 
-        embeddings_spatial = self.model.encoder.encoder(frames_reshaped)
-        embeddings_temporal = embeddings_spatial.reshape(batch_size, length, self.feature_dim)
-        embeddings_temporal = self.model.encoder.time_encoder(embeddings_temporal)
+        if total_len <= n:
+            features = self._encode_chunk(frames)
+        else:
+            chunk_features = []
+            for start in range(0, total_len, n):
+                end = min(start + n, total_len)
+                chunk = frames[:, :, start:end, :, :]
 
-        features = self.model.encoder.transformer(embeddings_temporal)
-        features = features.permute(0, 2, 1)
+                # Pad the last chunk if it's shorter than native_clip_len
+                if chunk.shape[2] < n:
+                    pad_len = n - chunk.shape[2]
+                    chunk = torch.nn.functional.pad(chunk, (0, 0, 0, 0, 0, pad_len), mode='replicate')
+                    encoded = self._encode_chunk(chunk)
+                    # Trim the padded frames from the output
+                    encoded = encoded[:, :, :end - start]
+                else:
+                    encoded = self._encode_chunk(chunk)
+
+                chunk_features.append(encoded)
+
+            features = torch.cat(chunk_features, dim=2)
 
         return features.unsqueeze(-1).unsqueeze(-1)
 
@@ -147,4 +199,5 @@ class PanEchoWrapper(nn.Module):
         clip_len = cfg.get('model', {}).get('max_clip_len', 16)
         peft_cfg = cfg.get('model', {}).get('peft')
         return cls(clip_len=clip_len, peft_cfg=peft_cfg)
+
 

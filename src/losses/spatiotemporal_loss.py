@@ -18,6 +18,7 @@ class SpatiotemporalLoss(nn.Module):
         edv_weight: float = 1.0,
         esv_weight: float = 1.0,
         ef_weight: float = 100.0,
+        ef_weight_target: float = 1.0,
         **kwargs,
     ):
         super().__init__()

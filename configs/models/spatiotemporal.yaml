@@ -1,5 +1,4 @@
-name: "SpatiotemporalPipeline"
-num_phases: 3
+name: "SpatiotemporalEchoModel"
 peft:
   enabled: true
   rank: 8

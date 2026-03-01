@@ -1,5 +1,5 @@
 model:
-  name: "SpatiotemporalPipeline"
+  name: "spatiotemporal"
   max_clip_len: 32
   
   fusion_space:
@@ -10,7 +10,7 @@ model:
   foundation_models:
     panecho:
       enabled: true
-      out_channels: 512
+      out_channels: 768
       out_spatial: [1, 1]
     echoprime:
       enabled: true
@@ -25,15 +25,15 @@ data:
 training:
   epochs: 50
   lr: 1.0e-4
-  batch_size: 16
+  batch_size: 12
   train_batch_size: 64
   val_batch_size: 64
-  num_workers: 4
+  num_workers: 12
   persistent_workers: true
   weight_decay: 5.0e-5
   patience: 10
   seed: 42
-  find_unused_parameters: false
+  find_unused_parameters: true
   save_dir: "/workspace/runs"
   checkpoint_dir: "/workspace/checkpoints"
   resume_path: null

@@ -4,7 +4,7 @@ import torch
 import glob
 from datetime import datetime
 from src.utils.logging import get_logger
-from src.utils.env import load_checkpoint
+from src.utils.config import load_checkpoint
 from src.registry import build_model, build_loss
 from src.utils.dist import is_main_process
 
