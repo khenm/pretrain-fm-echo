@@ -9,6 +9,7 @@ from typing import Dict, Any, Optional
 def load_config(config_path: str | Path) -> Dict[str, Any]:
     """
     Loads a configuration file and resolves component references robustly.
+    Includes smart merging for Plug-and-Play model architectures.
     """
     config_file = Path(config_path).resolve()
     
@@ -20,39 +21,59 @@ def load_config(config_path: str | Path) -> Dict[str, Any]:
         
     base_dir = config_file.parent
     
-    if isinstance(cfg.get('model'), str):
-        model_name = cfg['model']
+    model_block = cfg.get('model')
+    
+    if isinstance(model_block, str):
+        model_name = model_block
         model_config_path = base_dir / 'models' / f"{model_name}.yaml"
+        if not model_config_path.exists():
+            model_config_path = base_dir / f"{model_name}.yaml"
+            
         if not model_config_path.exists():
              raise FileNotFoundError(f"Model config not found at {model_config_path}")
              
         with open(model_config_path, 'r') as f:
-            model_cfg = yaml.safe_load(f)
-        cfg['model'] = model_cfg
+            cfg['model'] = yaml.safe_load(f)
+            
+    elif isinstance(model_block, dict) and 'name' in model_block:
+        model_name = model_block['name']
+        model_config_path = base_dir / 'models' / f"{model_name}.yaml"
         
-    if isinstance(cfg.get('data'), str):
-        dataset_name = cfg['data']
+        if not model_config_path.exists():
+            model_config_path = base_dir / f"{model_name}.yaml"
+            
+        if model_config_path.exists():
+            with open(model_config_path, 'r') as f:
+                specific_model_cfg = yaml.safe_load(f)
+            
+            merged_cfg = specific_model_cfg.copy()
+            merged_cfg.update(model_block)
+            
+            if 'name' in specific_model_cfg:
+                merged_cfg['name'] = specific_model_cfg['name']
+                
+            cfg['model'] = merged_cfg
+
+    data_block = cfg.get('data')
+    
+    if isinstance(data_block, str):
+        dataset_name = data_block
         dataset_config_path = base_dir / 'datasets' / f"{dataset_name}.yaml"
         if not dataset_config_path.exists():
              raise FileNotFoundError(f"Dataset config not found at {dataset_config_path}")
              
         with open(dataset_config_path, 'r') as f:
-            dataset_cfg = yaml.safe_load(f)
+            cfg['data'] = yaml.safe_load(f)
             
-        cfg['data'] = dataset_cfg
-    
-    elif isinstance(cfg.get('data'), dict) and 'name' in cfg['data']:
-        dataset_name = cfg['data']['name']
+    elif isinstance(data_block, dict) and 'name' in data_block:
+        dataset_name = data_block['name']
         dataset_config_path = base_dir / 'datasets' / f"{dataset_name}.yaml"
-        if not dataset_config_path.exists():
-            raise FileNotFoundError(f"Dataset config not found at {dataset_config_path}")
         
-        with open(dataset_config_path, 'r') as f:
-            dataset_cfg = yaml.safe_load(f)
-
-        inline_overrides = cfg['data']
-        dataset_cfg.update(inline_overrides)
-        cfg['data'] = dataset_cfg
+        if dataset_config_path.exists():
+            with open(dataset_config_path, 'r') as f:
+                dataset_cfg = yaml.safe_load(f)
+            dataset_cfg.update(data_block)
+            cfg['data'] = dataset_cfg
     
     return cfg
 

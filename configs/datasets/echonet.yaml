@@ -1,0 +1,9 @@
+name: "ECHONET"
+# root_dir: "/workspace/data/EchoNet-Dynamic"
+root_dir: "/kaggle/input/datasets/thatgrispybacon/echonet-dynamic/EchoNet-Dynamic"
+split_dir: ""
+nifti_dir: ""
+img_size: [224, 224]
+num_classes: 1
+stratify_bins: [0, 45, 100]
+return_keypoints: false

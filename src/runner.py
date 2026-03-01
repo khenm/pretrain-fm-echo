@@ -4,7 +4,7 @@ import torch
 import glob
 from datetime import datetime
 from src.utils.logging import get_logger
-from src.utils.env import load_checkpoint
+from src.utils.config import load_checkpoint
 from src.registry import build_model, build_loss
 from src.utils.dist import is_main_process
 
@@ -197,16 +197,17 @@ def get_criterions(cfg):
     return criterions
 
 def get_metrics(cfg):
-    """
-    Returns a dictionary of metrics for evaluation.
-    """
-    metrics = {}
-    try:
-        from torchmetrics import Accuracy
-        num_classes = cfg['data'].get('num_classes', 10)
-        task = "multiclass" if num_classes > 2 else "binary"
-        metrics['acc'] = Accuracy(task=task, num_classes=num_classes)
-    except ImportError:
-        logger.warning("torchmetrics not installed. Metrics will be empty.")
-    
+    """Returns a dictionary of metrics for evaluation."""
+    from monai.metrics import DiceMetric
+    from src.utils.metric import MAE, RMSE, R2Score
+
+    num_classes = cfg.get('data', {}).get('num_classes', 1)
+    include_bg = (num_classes == 1)
+
+    metrics = {
+        'mae': MAE(), 'rmse': RMSE(), 'r2': R2Score(),
+        'mae_edv': MAE(), 'rmse_edv': RMSE(), 'r2_edv': R2Score(),
+        'mae_esv': MAE(), 'rmse_esv': RMSE(), 'r2_esv': R2Score(),
+        'dice': DiceMetric(include_background=include_bg, reduction="mean"),
+    }
     return metrics

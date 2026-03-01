@@ -65,7 +65,7 @@ def build_model(cfg: Dict[str, Any], device: Any) -> Any:
     """
     Instantiates a model based on the configuration.
     """
-    model_name = cfg['model'].get('name', 'VAEUNet') # Default fallback
+    model_name = cfg['model'].get('name')
     model_cls = get_model_class(model_name)
     
     if hasattr(model_cls, 'from_config'):
@@ -77,7 +77,7 @@ def get_dataloaders(cfg: Dict[str, Any]) -> Any:
     """
     Instantiate dataloaders based on the configuration.
     """
-    data_name = cfg['data'].get('name', 'CAMUS').upper()
+    data_name = cfg['data'].get('name').upper()
     dataset_cls = get_dataset_class(data_name)
     
     if hasattr(dataset_cls, 'get_dataloaders'):

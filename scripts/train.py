@@ -10,8 +10,13 @@ from src.utils.logging import get_logger
 from src.runner import run_init, get_criterions, get_metrics
 from src.registry import build_model, get_dataloaders
 from src.trainer import Trainer
-from src.utils.env import TrainerState
+from src.utils.config import TrainerState
+from src.utils.dist import cleanup_dist
+import torch
 import torch.distributed as dist
+import src.models
+import src.datasets
+import src.losses
 
 def main():
     parser = argparse.ArgumentParser(description="PyTorch Generic Training Template")
@@ -27,42 +32,43 @@ def main():
         dist.init_process_group(backend="nccl")
         torch.cuda.set_device(args.local_rank)
     
-    # Init state
-    state = TrainerState(args.config, seed=42, device_id=max(0, args.local_rank))
-    cfg = state.config
+    try:
+        # Init state
+        state = TrainerState(args.config, seed=42, device_id=max(0, args.local_rank))
+        cfg = state.config
 
-    # Init workspace, logging, seed, wandb, returns device
-    device = run_init(state, args_resume=args.resume)
-    logger = get_logger()
-    
-    # Build Dataset/Dataloaders
-    logger.info("Building dataloaders...")
-    loaders = get_dataloaders(cfg)
-    
-    # Build Model
-    logger.info("Initializing model...")
-    model = build_model(cfg, device)
-    
-    # Build Losses and Metrics
-    logger.info("Setting up losses and metrics...")
-    criterions = get_criterions(cfg)
-    metrics = get_metrics(cfg)
-    
-    # Create Trainer and start
-    logger.info("Initializing Trainer...")
-    trainer = Trainer(
-        model=model,
-        loaders=loaders,
-        cfg=cfg,
-        device=device,
-        criterions=criterions,
-        metrics=metrics,
-        state=state
-    )
-    
-    logger.info("Starting training...")
-    trainer.train()
-    logger.info("Training completed.")
+        # Init workspace, logging, seed, wandb, returns device
+        device = run_init(state, args_resume=args.resume)
+        logger = get_logger()
+        
+        # Build Dataset/Dataloaders
+        logger.info("Building dataloaders...")
+        loaders = get_dataloaders(cfg)
+        
+        # Build Model
+        logger.info("Initializing model...")
+        model = build_model(cfg, device)
+        
+        # Build Losses and Metrics
+        logger.info("Setting up losses and metrics...")
+        criterions = get_criterions(cfg)
+        metrics = get_metrics(cfg)
+        
+        # Create Trainer and start
+        logger.info("Initializing Trainer...")
+        trainer = Trainer(
+            model=model,
+            loaders=loaders,
+            criterions=criterions,
+            metrics=metrics,
+            state=state
+        )
+        
+        logger.info("Starting training...")
+        trainer.train()
+        logger.info("Training completed.")
+    finally:
+        cleanup_dist()
 
 if __name__ == "__main__":
     main()

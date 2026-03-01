@@ -13,10 +13,20 @@ dependencies = [
     "numpy>=1.26.4",
     "torchvision",
     "torchaudio",
+    "torchmetrics",
     "tqdm",
     "pandas",
     "pyyaml",
     "wandb",
+    "opencv-python-headless",
+    "wrapt",
+    "monai",
+    "matplotlib",
+    "pydicom",
+    "scikit-learn",
+    "transformers",
+    "timm",
+    "peft"
 ]
 
 
