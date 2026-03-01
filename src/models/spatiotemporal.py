@@ -216,7 +216,7 @@ class SpatiotemporalEchoModel(nn.Module):
 
         fused_features = self.fusion_conv(weighted_concat)
         mask_logits = self.decoder(fused_features)
-        vol_curve = self.volume_head(mask_logits.detach(), fused_features.detach())
+        vol_curve = self.volume_head(mask_logits, fused_features)
         phase_logits = self.phase_head(fused_features)
 
         # Probabilistic Volume Extraction using Softmax Temperature

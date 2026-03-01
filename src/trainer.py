@@ -34,7 +34,9 @@ class Trainer:
             self.ld_tr, self.ld_va, self.ld_ts = loaders
 
         self.criterions = criterions or {'ce': torch.nn.CrossEntropyLoss()}
-        self.metrics = metrics or {}
+        self.val_metrics = metrics or {}
+        import copy
+        self.train_metrics = {k: v.clone() if hasattr(v, 'clone') else copy.deepcopy(v) for k, v in self.val_metrics.items()}
 
         # Fetch dynamic dataset keys to prevent magic string failures
         self.input_key = self.cfg.get('data', {}).get('input_key', 'image')
@@ -43,7 +45,10 @@ class Trainer:
         self.num_classes = self.cfg.get('data', {}).get('num_classes', 10)
         self._setup_optimization()
 
-        for k, metric in self.metrics.items():
+        for k, metric in self.train_metrics.items():
+            if hasattr(metric, 'to'):
+                metric.to(self.device)
+        for k, metric in self.val_metrics.items():
             if hasattr(metric, 'to'):
                 metric.to(self.device)
 
@@ -112,10 +117,10 @@ class Trainer:
             if hasattr(self.ld_tr, 'sampler') and hasattr(self.ld_tr.sampler, 'set_epoch'):
                 self.ld_tr.sampler.set_epoch(ep)
 
-            avg_loss, loss_comps = self._run_epoch(ep, epochs)
+            avg_loss, loss_comps, train_metrics_res = self._run_epoch(ep, epochs)
             val_result = self._validate()
 
-            self._log_epoch(ep, avg_loss, loss_comps, val_result)
+            self._log_epoch(ep, avg_loss, loss_comps, train_metrics_res, val_result)
 
             score = val_result.get('dice', list(val_result.values())[0])
             is_best = False
@@ -134,6 +139,9 @@ class Trainer:
 
     def _run_epoch(self, ep, max_ep):
         self.model.train()
+        for m in self.train_metrics.values():
+            if hasattr(m, 'reset'):
+                m.reset()
         run_loss = 0.0
         loss_components = {}
 
@@ -142,7 +150,8 @@ class Trainer:
 
         for batch_idx, batch in enumerate(pbar):
             with torch.amp.autocast(device_type=self.device.type if hasattr(self.device, 'type') else str(self.device)):
-                loss, batch_comps = self._process_batch(batch)
+                loss, batch_comps, outputs, targets = self._process_batch(batch)
+                self._update_metrics(outputs, targets, metrics_dict=self.train_metrics)
 
             scaled_loss = loss / self.accum_steps
             
@@ -187,7 +196,8 @@ class Trainer:
 
         avg_loss = run_loss / len(self.ld_tr)
         avg_comps = {k: v / len(self.ld_tr) for k, v in loss_components.items()}
-        return avg_loss, avg_comps
+        train_metric_results = self._aggregate_metrics(self.train_metrics)
+        return avg_loss, avg_comps, train_metric_results
 
     def _process_batch(self, batch):
         if isinstance(batch, dict):
@@ -213,11 +223,11 @@ class Trainer:
                 loss += result
                 comps[loss_name] = result.item()
 
-        return loss, comps
+        return loss, comps, outputs, targets
 
     def _validate(self):
         self.model.eval()
-        for m in self.metrics.values():
+        for m in self.val_metrics.values():
             if hasattr(m, 'reset'):
                 m.reset()
 
@@ -235,16 +245,21 @@ class Trainer:
                     inputs, targets = batch[0].to(self.device), batch[1].to(self.device)
 
                 outputs = self.model(inputs)
-                self._update_val_metrics(outputs, targets)
+                self._update_metrics(outputs, targets, metrics_dict=self.val_metrics)
 
-        return self._aggregate_metrics()
+        return self._aggregate_metrics(self.val_metrics)
 
-    def _update_val_metrics(self, outputs, targets):
+    def _update_metrics(self, outputs, targets, metrics_dict):
         if not isinstance(outputs, dict) or not isinstance(targets, dict):
             return
 
-        mask_logits = outputs['mask_logits']
-        vol_curve = outputs['vol_curve']
+        outputs = {k: v.detach() if isinstance(v, torch.Tensor) else v for k, v in outputs.items()}
+
+        mask_logits = outputs.get('mask_logits')
+        vol_curve = outputs.get('vol_curve')
+        
+        if mask_logits is None or vol_curve is None:
+            return
 
         target_edv = targets.get('target_edv')
         target_esv = targets.get('target_esv')
@@ -254,7 +269,7 @@ class Trainer:
         B, T = vol_curve.shape
 
         # --- EF metrics ---
-        if target_ef is not None and 'mae' in self.metrics:
+        if target_ef is not None and 'mae' in metrics_dict:
             pred_edv = outputs.get('pred_edv')
             pred_esv = outputs.get('pred_esv')
             if pred_edv is not None and pred_esv is not None:
@@ -265,14 +280,14 @@ class Trainer:
                 )
                 valid_ef = (target_ef >= 0)
                 if valid_ef.any():
-                    self.metrics['mae'](pred_ef[valid_ef], target_ef[valid_ef])
-                    if 'rmse' in self.metrics:
-                        self.metrics['rmse'](pred_ef[valid_ef], target_ef[valid_ef])
-                    if 'r2' in self.metrics:
-                        self.metrics['r2'](pred_ef[valid_ef], target_ef[valid_ef])
+                    metrics_dict['mae'](pred_ef[valid_ef], target_ef[valid_ef])
+                    if 'rmse' in metrics_dict:
+                        metrics_dict['rmse'](pred_ef[valid_ef], target_ef[valid_ef])
+                    if 'r2' in metrics_dict:
+                        metrics_dict['r2'](pred_ef[valid_ef], target_ef[valid_ef])
 
         # --- EDV / ESV volume metrics ---
-        if target_edv is not None and 'mae_edv' in self.metrics:
+        if target_edv is not None and 'mae_edv' in metrics_dict:
             pred_edv = outputs.get('pred_edv')
             pred_esv = outputs.get('pred_esv')
             
@@ -281,20 +296,20 @@ class Trainer:
                 if valid_edv.any():
                     p_edv_ml = pred_edv[valid_edv] * 300.0
                     t_edv_ml = target_edv[valid_edv] * 300.0
-                    self.metrics['mae_edv'](p_edv_ml, t_edv_ml)
-                    self.metrics['rmse_edv'](p_edv_ml, t_edv_ml)
-                    self.metrics['r2_edv'](p_edv_ml, t_edv_ml)
+                    metrics_dict['mae_edv'](p_edv_ml, t_edv_ml)
+                    metrics_dict['rmse_edv'](p_edv_ml, t_edv_ml)
+                    metrics_dict['r2_edv'](p_edv_ml, t_edv_ml)
 
                 valid_esv = (target_esv >= 0)
                 if valid_esv.any():
                     p_esv_ml = pred_esv[valid_esv] * 300.0
                     t_esv_ml = target_esv[valid_esv] * 300.0
-                    self.metrics['mae_esv'](p_esv_ml, t_esv_ml)
-                    self.metrics['rmse_esv'](p_esv_ml, t_esv_ml)
-                    self.metrics['r2_esv'](p_esv_ml, t_esv_ml)
+                    metrics_dict['mae_esv'](p_esv_ml, t_esv_ml)
+                    metrics_dict['rmse_esv'](p_esv_ml, t_esv_ml)
+                    metrics_dict['r2_esv'](p_esv_ml, t_esv_ml)
 
         # --- Dice metric ---
-        if 'dice' in self.metrics:
+        if 'dice' in metrics_dict:
             target_masks = targets.get('label')
             if target_masks is not None:
                 pred_probs = torch.sigmoid(mask_logits)
@@ -320,7 +335,7 @@ class Trainer:
                         target_flat = target_binary.permute(0, 2, 1, 3, 4).reshape(
                             Bf * Tf, target_binary.shape[1], *target_binary.shape[-2:]
                         )
-                        self.metrics['dice'](pred_flat[valid_idx], target_flat[valid_idx])
+                        metrics_dict['dice'](pred_flat[valid_idx], target_flat[valid_idx])
                 else:
                     Bm2, Tm2 = pred_binary.shape[0], pred_binary.shape[2]
                     pred_flat = pred_binary.permute(0, 2, 1, 3, 4).reshape(
@@ -329,10 +344,10 @@ class Trainer:
                     target_flat = target_binary.permute(0, 2, 1, 3, 4).reshape(
                         Bm2 * Tm2, target_binary.shape[1], *target_binary.shape[-2:]
                     )
-                    self.metrics['dice'](pred_flat, target_flat)
+                    metrics_dict['dice'](pred_flat, target_flat)
 
         # --- Phase accuracy ---
-        if 'phase_acc' in self.metrics:
+        if 'phase_acc' in metrics_dict:
             phase_logits = outputs.get('phase_logits')
             if phase_logits is not None and frame_mask is not None:
                 phase_targets = frame_mask.long()
@@ -349,14 +364,14 @@ class Trainer:
 
                 valid_phase = phase_targets > 0
                 if valid_phase.any():
-                    self.metrics['phase_acc'](
+                    metrics_dict['phase_acc'](
                         phase_preds[valid_phase],
                         phase_targets[valid_phase]
                     )
 
-    def _aggregate_metrics(self):
+    def _aggregate_metrics(self, metrics_dict):
         results = {}
-        for k, metric in self.metrics.items():
+        for k, metric in metrics_dict.items():
             if hasattr(metric, 'aggregate'):
                 results[k] = float(metric.aggregate())
             elif hasattr(metric, 'compute'):
@@ -387,12 +402,16 @@ class Trainer:
             return self.state.current_epoch, self.state.best_metric
         return 1, -float('inf')
 
-    def _log_epoch(self, ep, loss, comps, val_res):
+    def _log_epoch(self, ep, loss, comps, train_metrics, val_res):
         if not is_main_process():
             return
 
         train_strs = [f"{k}={v:.4f}" for k, v in comps.items()]
-        msg_train = f"E{ep:03d} Train loss={loss:.4f} " + " ".join(train_strs)
+        t_metric_strs = [f"{k.upper()}={v:.4f}" for k, v in train_metrics.items()]
+        if t_metric_strs:
+            msg_train = f"E{ep:03d} Train loss={loss:.4f} " + " ".join(train_strs) + " " + " ".join(t_metric_strs)
+        else:
+            msg_train = f"E{ep:03d} Train loss={loss:.4f} " + " ".join(train_strs)
         logger.info(msg_train)
 
         val_strs = [f"{k.upper()}={v:.4f}" for k, v in val_res.items()]
@@ -400,7 +419,9 @@ class Trainer:
         logger.info(msg_val)
 
         if WANDB_AVAILABLE and wandb.run is not None:
-            log_dict = {"val/loss": loss}
+            log_dict = {"train/loss": loss}
+            for k, v in train_metrics.items():
+                log_dict[f"train/{k}"] = v
             for k, v in val_res.items():
                 log_dict[f"val/{k}"] = v
             wandb.log(log_dict)
