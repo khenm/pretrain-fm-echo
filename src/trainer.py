@@ -16,6 +16,42 @@ except ImportError:
 
 logger = get_logger()
 
+class LossWeightScheduler:
+    """
+    Dynamically scales loss component weights during training to prevent 
+    unstable gradients from complex compound metrics (like ratios) early on.
+    """
+    def __init__(self, criterions_dict, target_attr='ef_weight', start_epoch=10, end_epoch=20, max_weight=1.0):
+        self.criterions_dict = criterions_dict
+        self.target_attr = target_attr
+        self.start_epoch = start_epoch
+        self.end_epoch = end_epoch
+        self.max_weight = max_weight
+        self.current_weight = 0.0
+
+    def step(self, epoch):
+        # Calculate the linear warmup interpolation
+        if epoch < self.start_epoch:
+            new_weight = 0.0
+        elif epoch >= self.end_epoch:
+            new_weight = self.max_weight
+        else:
+            progress = (epoch - self.start_epoch) / (self.end_epoch - self.start_epoch)
+            new_weight = self.max_weight * progress
+
+        # Apply the weight if it has changed
+        if new_weight != self.current_weight:
+            self.current_weight = new_weight
+            for name, criterion in self.criterions_dict.items():
+                if hasattr(criterion, self.target_attr):
+                    # Handle both standard floats and registered buffer tensors
+                    if isinstance(getattr(criterion, self.target_attr), torch.Tensor):
+                        getattr(criterion, self.target_attr).fill_(self.current_weight)
+                    else:
+                        setattr(criterion, self.target_attr, self.current_weight)
+                    
+                    logger.info(f"\u2696\ufe0f Loss Topology Update: Set '{name}' {self.target_attr} to {self.current_weight:.4f}")
+
 class Trainer:
     """
     Handles generic training and validation across unified architectures.
@@ -34,6 +70,14 @@ class Trainer:
             self.ld_tr, self.ld_va, self.ld_ts = loaders
 
         self.criterions = criterions or {'ce': torch.nn.CrossEntropyLoss()}
+        scheduler_cfg = self.cfg.get('training', {}).get('ef_warmup', {})
+        self.loss_scheduler = LossWeightScheduler(
+            criterions_dict=self.criterions,
+            target_attr='ef_weight',
+            start_epoch=scheduler_cfg.get('start_epoch', 10),
+            end_epoch=scheduler_cfg.get('end_epoch', 20),
+            max_weight=self.cfg.get('loss', {}).get('kwargs', {}).get('ef_weight_target', 1.0)
+        )
         self.val_metrics = metrics or {}
         import copy
         self.train_metrics = {k: v.clone() if hasattr(v, 'clone') else copy.deepcopy(v) for k, v in self.val_metrics.items()}
@@ -113,7 +157,8 @@ class Trainer:
         logger.info(f"Starting training from epoch {start_ep}")
 
         for ep in range(start_ep, epochs + 1):
-
+            self.loss_scheduler.step(ep)
+            
             if hasattr(self.ld_tr, 'sampler') and hasattr(self.ld_tr.sampler, 'set_epoch'):
                 self.ld_tr.sampler.set_epoch(ep)
 
@@ -232,22 +277,41 @@ class Trainer:
                 m.reset()
 
         dev_type = self.device.type if hasattr(self.device, 'type') else str(self.device)
+        
+        run_loss = 0.0
+        loss_components = {}
 
         with torch.no_grad(), torch.amp.autocast(device_type=dev_type):
             for batch in tqdm(self.ld_va, desc="Validating", mininterval=2.0, leave=False):
-                if isinstance(batch, dict):
-                    inputs = batch[self.input_key].to(self.device)
-                    if self.target_key == 'batch':
-                        targets = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-                    else:
-                        targets = batch[self.target_key].to(self.device)
-                else:
-                    inputs, targets = batch[0].to(self.device), batch[1].to(self.device)
-
-                outputs = self.model(inputs)
+                loss, batch_comps, outputs, targets = self._process_batch(batch)
                 self._update_metrics(outputs, targets, metrics_dict=self.val_metrics)
+                
+                run_loss += loss.item()
+                for k, v in batch_comps.items():
+                    if k not in loss_components:
+                        loss_components[k] = 0.0
+                    loss_components[k] += v
 
-        return self._aggregate_metrics(self.val_metrics)
+        if dist.is_available() and dist.is_initialized():
+            run_loss_t = torch.tensor(run_loss, device=self.device)
+            run_loss = reduce_tensor(run_loss_t).item()
+            for k in loss_components:
+                val = loss_components[k]
+                if isinstance(val, torch.Tensor):
+                    comp_t = val.detach().clone().to(self.device)
+                else:
+                    comp_t = torch.tensor(val, device=self.device)
+                loss_components[k] = reduce_tensor(comp_t).item()
+                
+        avg_loss = run_loss / max(1, len(self.ld_va))
+        avg_comps = {k: v / max(1, len(self.ld_va)) for k, v in loss_components.items()}
+
+        val_res = self._aggregate_metrics(self.val_metrics)
+        val_res['loss'] = avg_loss
+        for k, v in avg_comps.items():
+            val_res[k] = v
+            
+        return val_res
 
     def _update_metrics(self, outputs, targets, metrics_dict):
         if not isinstance(outputs, dict) or not isinstance(targets, dict):
@@ -419,7 +483,11 @@ class Trainer:
         logger.info(msg_val)
 
         if WANDB_AVAILABLE and wandb.run is not None:
-            log_dict = {"train/loss": loss}
+            log_dict = {"train/loss": loss, "epoch": ep}
+            if hasattr(self, 'opt') and self.opt is not None and len(self.opt.param_groups) > 0:
+                log_dict["train/lr"] = self.opt.param_groups[0]["lr"]
+            for k, v in comps.items():
+                log_dict[f"train/{k}"] = v
             for k, v in train_metrics.items():
                 log_dict[f"train/{k}"] = v
             for k, v in val_res.items():

@@ -5,178 +5,81 @@ from monai.losses import DiceCELoss
 
 from src.registry import register_loss
 
-class PolarFocalVolumeLoss(nn.Module):
-    """
-    A difficulty-aware orthogonal loss function. 
-    Projects EDV/ESV into polar space (Magnitude/Angle) and applies independent 
-    focal difficulty weighting to both the scale and the physiological ratio.
-    """
-    def __init__(
-        self, 
-        gamma: float = 2.0,
-        scale_weight: float = 1.0, 
-        ratio_weight: float = 10.0, 
-        sv_weight: float = 1.0,
-        clip_threshold: float = 0.5,
-        eps: float = 1e-7
-    ):
-        super().__init__()
-        self.gamma = gamma
-        self.scale_weight = scale_weight
-        self.ratio_weight = ratio_weight
-        self.sv_weight = sv_weight
-        self.clip_threshold = clip_threshold
-        self.eps = eps
-
-    def forward(
-        self, 
-        pred_edv: torch.Tensor, 
-        pred_esv: torch.Tensor, 
-        target_edv: torch.Tensor, 
-        target_esv: torch.Tensor
-    ) -> tuple[torch.Tensor, dict]:
-        
-        p_edv, p_esv = pred_edv.view(-1), pred_esv.view(-1)
-        t_edv, t_esv = target_edv.view(-1), target_esv.view(-1)
-        
-        valid = (t_edv >= 0) & (t_esv >= 0)
-        
-        if not valid.any():
-            dummy_loss = 0.0 * p_edv.sum()
-            return dummy_loss, {"scale_loss": dummy_loss.detach(), "ratio_loss": dummy_loss.detach(), "sv_loss": dummy_loss.detach()}
-
-        pred_vec = torch.stack([p_edv[valid], p_esv[valid]], dim=-1)
-        target_vec = torch.stack([t_edv[valid], t_esv[valid]], dim=-1)
-
-        pred_mag = torch.norm(pred_vec, p=2, dim=-1)
-        target_mag = torch.norm(target_vec, p=2, dim=-1)
-        
-        base_loss_scale = F.huber_loss(pred_mag, target_mag, reduction='none', delta=self.clip_threshold)
-        
-        error_scale = torch.abs(pred_mag - target_mag)
-        relative_error_scale = error_scale / (target_mag + self.eps)
-        p_scale = torch.clamp(relative_error_scale, min=0.0, max=1.0)
-        weight_scale = (1.0 + torch.pow(p_scale, self.gamma)).detach()
-        
-        focal_loss_scale = (weight_scale * base_loss_scale).mean()
-
-        cos_sim = F.cosine_similarity(pred_vec, target_vec, dim=-1, eps=self.eps) 
-        base_loss_ratio = 1.0 - cos_sim
-        
-        p_ratio = torch.clamp(base_loss_ratio, min=0.0, max=1.0)
-        weight_ratio = (1.0 + torch.pow(p_ratio, self.gamma)).detach()
-        
-        focal_loss_ratio = (weight_ratio * base_loss_ratio).mean()
-
-        pred_sv = p_edv[valid] - p_esv[valid]
-        target_sv = t_edv[valid] - t_esv[valid]
-        
-        base_loss_sv = F.huber_loss(pred_sv, target_sv, reduction='none', delta=self.clip_threshold)
-        
-        error_sv = torch.abs(pred_sv - target_sv)
-        relative_error_sv = error_sv / (torch.abs(target_sv) + self.eps)
-        p_sv = torch.clamp(relative_error_sv, min=0.0, max=1.0)
-        weight_sv = (1.0 + torch.pow(p_sv, self.gamma)).detach()
-        
-        focal_loss_sv = (weight_sv * base_loss_sv).mean()
-
-        total_loss = (self.scale_weight * focal_loss_scale) + \
-                     (self.ratio_weight * focal_loss_ratio) + \
-                     (self.sv_weight * focal_loss_sv)
-
-        return total_loss, {
-            "scale_loss": focal_loss_scale.detach(),
-            "ratio_loss": focal_loss_ratio.detach(),
-            "sv_loss": focal_loss_sv.detach()
-        }
-
 @register_loss("SpatiotemporalLoss")
 class SpatiotemporalLoss(nn.Module):
     """
-    Computes spatial segmentation (DiceCE) and volumetric regression losses (PolarFocalVolumeLoss) 
-    for spatiotemporal echocardiography.
+    Computes spatial segmentation (DiceCE) and L1 regression losses 
+    for Spatiotemporal echocardiography.
     """
     def __init__(
         self,
         dice_weight: float = 1.0,
         volume_weight: float = 1.0,
-        phase_weight: float = 0.5,
-        gamma: float = 2.0,
-        focal_clip_threshold: float = 0.5,
-        focal_scale_weight: float = 1.0,
-        focal_ratio_weight: float = 10.0,
-        focal_sv_weight: float = 1.0,
+        edv_weight: float = 1.0,
+        esv_weight: float = 1.0,
+        ef_weight: float = 100.0,
+        **kwargs,
     ):
         super().__init__()
+        if kwargs:
+            import logging
+            logging.getLogger().warning(f"SpatiotemporalLoss ignoring unexpected kwargs: {list(kwargs.keys())}")
         self.dice_weight = dice_weight
         self.volume_weight = volume_weight
-        self.phase_weight = phase_weight
+        
+        self.edv_weight = edv_weight
+        self.esv_weight = esv_weight
+        self.ef_weight = ef_weight
 
         self.dice_func = DiceCELoss(sigmoid=True, reduction='mean')
-        self.phase_loss_fn = nn.CrossEntropyLoss(ignore_index=0)
-
-        self.vol_loss_func = PolarFocalVolumeLoss(
-            gamma=gamma,
-            scale_weight=focal_scale_weight,
-            ratio_weight=focal_ratio_weight,
-            sv_weight=focal_sv_weight,
-            clip_threshold=focal_clip_threshold
-        )
+        self.l1_loss = nn.L1Loss(reduction='none')
 
     def forward(self, outputs, targets):
         """
         Args:
-            outputs (dict): Contains 'mask_logits', 'vol_curve', 'phase_logits', 'pred_edv', 'pred_esv'
-            targets (dict): Raw dataloader batch containing 'label', 'target_edv', 'target_esv', 'frame_mask'
+            outputs (dict): Contains 'mask_logits', 'vol_curve', 'pred_edv', 'pred_esv', 'pred_ef'
+            targets (dict): Raw dataloader batch containing 'label', 'target_edv', 'target_esv', 'target_ef', 'frame_mask'
         """
         mask_logits = outputs['mask_logits']
-        vol_curve = outputs['vol_curve']
 
         target_masks = targets['label']
         target_edv = targets['target_edv']
         target_esv = targets['target_esv']
+        target_ef = targets.get('target_ef')
         frame_mask = targets['frame_mask']
-
-        B, T = vol_curve.shape
 
         loss_dice = self._compute_dice_loss(mask_logits, target_masks, frame_mask)
 
         pred_edv = outputs.get('pred_edv', torch.zeros_like(target_edv))
         pred_esv = outputs.get('pred_esv', torch.zeros_like(target_esv))
+        pred_ef = outputs.get('pred_ef', torch.zeros_like(pred_edv))
 
-        loss_vol, vol_loss_dict = self.vol_loss_func(
-            pred_edv, pred_esv, target_edv, target_esv
-        )
+        valid_edv_esv = (target_edv >= 0) & (target_esv >= 0)
+        
+        loss_edv = torch.tensor(0.0, device=pred_edv.device)
+        loss_esv = torch.tensor(0.0, device=pred_esv.device)
+        loss_ef = torch.tensor(0.0, device=pred_edv.device)
 
+        if valid_edv_esv.any():
+            loss_edv = self.l1_loss(pred_edv[valid_edv_esv], target_edv[valid_edv_esv]).mean()
+            loss_esv = self.l1_loss(pred_esv[valid_edv_esv], target_esv[valid_edv_esv]).mean()
+            
+        if target_ef is not None:
+            valid_ef = (target_ef >= 0)
+            if valid_ef.any():
+                loss_ef = self.l1_loss(pred_ef[valid_ef], target_ef[valid_ef]).mean()
+
+        loss_vol = (self.edv_weight * loss_edv) + (self.esv_weight * loss_esv) + (self.ef_weight * loss_ef)
         total_loss = (self.dice_weight * loss_dice) + (self.volume_weight * loss_vol)
-
-        # --- Phase Classification Loss ---
-        loss_phase = torch.tensor(0.0, device=vol_curve.device)
-        phase_logits = outputs.get('phase_logits')
-        if phase_logits is not None and self.phase_weight > 0:
-            phase_targets = frame_mask.long()
-            _, num_phases, T_phase = phase_logits.shape
-
-            if T_phase != phase_targets.shape[1]:
-                phase_logits = F.interpolate(
-                    phase_logits, 
-                    size=phase_targets.shape[1], 
-                    mode='linear', 
-                    align_corners=False
-                )
-
-            loss_phase = self.phase_loss_fn(phase_logits, phase_targets)
-            total_loss = total_loss + (self.phase_weight * loss_phase)
 
         loss_dict = {
             "loss": total_loss,
             "dice_loss": loss_dice.detach(),
             "volume_loss": loss_vol.detach(),
-            "phase_loss": loss_phase.detach(),
+            "loss_edv": loss_edv.detach(),
+            "loss_esv": loss_esv.detach(),
+            "loss_ef": loss_ef.detach(),
         }
-
-        if vol_loss_dict:
-            loss_dict.update({k: v.detach() for k, v in vol_loss_dict.items()})
 
         return total_loss, loss_dict
 
@@ -217,10 +120,7 @@ class SpatiotemporalLoss(nn.Module):
         return cls(
             dice_weight=loss_cfg.get("dice_weight", 1.0),
             volume_weight=loss_cfg.get("volume_weight", 1.0),
-            phase_weight=loss_cfg.get("phase_weight", 0.5),
-            gamma=loss_cfg.get("gamma", 2.0),
-            focal_clip_threshold=loss_cfg.get("clip_threshold", 0.5),
-            focal_scale_weight=loss_cfg.get("scale_weight", 1.0),
-            focal_ratio_weight=loss_cfg.get("ratio_weight", 10.0),
-            focal_sv_weight=loss_cfg.get("sv_weight", 1.0)
+            edv_weight=loss_cfg.get("edv_weight", 1.0),
+            esv_weight=loss_cfg.get("esv_weight", 1.0),
+            ef_weight=loss_cfg.get("ef_weight", 100.0)
         )

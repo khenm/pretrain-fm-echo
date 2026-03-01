@@ -9,24 +9,42 @@ from src.registry import register_model
 
 logger = logging.getLogger(__name__)
 
-
 def load_panecho_isolated(clip_len=16):
-    """Loads PanEcho from PyTorch Hub, isolating sys.path and sys.modules to prevent naming collisions."""
+    """Loads PanEcho bypassing torch.hub to prevent namespace collisions using importlib."""
     import sys
     import os
     import torch
     import torch.distributed as dist
-    import importlib
+    import importlib.util
+    
+    import timm
+    try:
+        import wandb
+        import pydantic
+    except ImportError:
+        pass
+    # ---------------------------------------------------------
 
+    hub_dir = os.path.expanduser('~/.cache/torch/hub/CarDS-Yale_PanEcho_main')
+    
+    if not os.path.exists(hub_dir):
+        try:
+            torch.hub.load('CarDS-Yale/PanEcho', 'PanEcho', pretrained=False, trust_repo=True)
+        except Exception as e:
+            logger.warning(f"Failed to pre-download PanEcho: {e}")
+
+    # Aggressively remove EVERY local path that might shadow the repo's 'src'
     orig_path = list(sys.path)
     cwd = os.getcwd()
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+    
+    sys.path = [p for p in sys.path if p and p not in (cwd, project_root, '')]
+    sys.path.insert(0, hub_dir)
 
     stashed_modules = {}
     for mod_name in list(sys.modules.keys()):
         if mod_name == 'src' or mod_name.startswith('src.'):
-            stashed_modules[mod_name] = sys.modules.pop(mod_name)
-
-    sys.path = [p for p in sys.path if p and p != cwd]
+            stashed_modules[mod_name] = sys.modules.pop(mod_name, None)
 
     try:
         is_distributed = dist.is_initialized()
@@ -35,7 +53,12 @@ def load_panecho_isolated(clip_len=16):
         if is_distributed and local_rank != 0:
             dist.barrier()
 
-        model = torch.hub.load('CarDS-Yale/PanEcho', 'PanEcho', pretrained=True, clip_len=clip_len, trust_repo=True)
+        # Load PanEcho from its hubconf directly
+        pt_path = os.path.join(hub_dir, 'hubconf.py')
+        spec = importlib.util.spec_from_file_location("panecho_hubconf", pt_path)
+        hubconf = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hubconf)
+        model = hubconf.PanEcho(pretrained=True, clip_len=clip_len)
 
         if is_distributed and local_rank == 0:
             dist.barrier()
@@ -43,16 +66,14 @@ def load_panecho_isolated(clip_len=16):
         return model
     finally:
         sys.path = orig_path
-
+        
         for mod_name in list(sys.modules.keys()):
             if mod_name == 'src' or mod_name.startswith('src.'):
-                del sys.modules[mod_name]
-
+                sys.modules.pop(mod_name, None)
+                
         for mod_name, mod_info in stashed_modules.items():
-            sys.modules[mod_name] = mod_info
-
-        if 'src' not in sys.modules:
-            import src
+            if mod_info is not None:
+                sys.modules[mod_name] = mod_info
 
 
 @register_model("PanEchoWrapper")

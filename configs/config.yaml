@@ -1,6 +1,21 @@
 model:
   name: "SpatiotemporalPipeline"
   max_clip_len: 32
+  
+  fusion_space:
+    channels: 256
+    time_steps: 16
+    spatial_size: [14, 14]
+
+  foundation_models:
+    panecho:
+      enabled: true
+      out_channels: 512
+      out_spatial: [1, 1]
+    echoprime:
+      enabled: true
+      out_channels: 768
+      out_spatial: [7, 7]
 
 data: 
   name: "echonet"
@@ -18,7 +33,7 @@ training:
   weight_decay: 5.0e-5
   patience: 10
   seed: 42
-  find_unused_parameters: true
+  find_unused_parameters: false
   save_dir: "/workspace/runs"
   checkpoint_dir: "/workspace/checkpoints"
   resume_path: null
@@ -29,11 +44,10 @@ loss:
   kwargs:
     dice_weight: 1.0
     volume_weight: 1.0
-    gamma: 2.0
-    focal_clip_threshold: 0.5
-    focal_scale_weight: 1.0
-    focal_ratio_weight: 1.0
-    focal_sv_weight: 1.0
+    edv_weight: 1.0
+    esv_weight: 1.0
+    ef_weight: 0.0
+    ef_weight_target: 1.0
 
 wandb:
   enable: false

@@ -199,11 +199,9 @@ def get_criterions(cfg):
 def get_metrics(cfg):
     """Returns a dictionary of metrics for evaluation."""
     from monai.metrics import DiceMetric
-    from torchmetrics.classification import MulticlassAccuracy
     from src.utils.metric import MAE, RMSE, R2Score
 
     num_classes = cfg.get('data', {}).get('num_classes', 1)
-    num_phases = cfg.get('model', {}).get('num_phases', 3)
     include_bg = (num_classes == 1)
 
     metrics = {
@@ -211,6 +209,5 @@ def get_metrics(cfg):
         'mae_edv': MAE(), 'rmse_edv': RMSE(), 'r2_edv': R2Score(),
         'mae_esv': MAE(), 'rmse_esv': RMSE(), 'r2_esv': R2Score(),
         'dice': DiceMetric(include_background=include_bg, reduction="mean"),
-        'phase_acc': MulticlassAccuracy(num_classes=num_phases, average='macro', ignore_index=0),
     }
     return metrics
