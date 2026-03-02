@@ -106,9 +106,19 @@ def load_checkpoint(ckpt_path, model, optimizer=None, scaler=None, device='cpu',
     def restore_rng(rng_state):
         if rng_state is None: return
         try:
-            torch.set_rng_state(rng_state["torch"])
+            torch_rng = rng_state["torch"]
+            if isinstance(torch_rng, torch.Tensor):
+                torch_rng = torch_rng.cpu()
+            torch.set_rng_state(torch_rng)
+            
             if torch.cuda.is_available() and "cuda" in rng_state and rng_state["cuda"] is not None:
-                torch.cuda.set_rng_state_all(rng_state["cuda"])
+                cuda_rng = rng_state["cuda"]
+                if isinstance(cuda_rng, list):
+                    cuda_rng = [s.cpu() if isinstance(s, torch.Tensor) else s for s in cuda_rng]
+                elif isinstance(cuda_rng, torch.Tensor):
+                    cuda_rng = cuda_rng.cpu()
+                torch.cuda.set_rng_state_all(cuda_rng)
+                
             np.random.set_state(rng_state["numpy"])
             random.setstate(rng_state["python"])
             print("Restored RNG states")
@@ -184,7 +194,7 @@ class TrainerState:
         """Restores model, optimizer, and synchronizes the state manager's internal trackers."""
         start_epoch, best_metric = load_checkpoint(
             ckpt_path, model, optimizer=optimizer, scaler=scaler, 
-            device=self.device, load_rng=True, strict=True
+            device=self.device, load_rng=True, strict=False
         )
         self.current_epoch = start_epoch
         self.best_metric = best_metric

@@ -1,21 +1,5 @@
 model:
   name: "spatiotemporal"
-  max_clip_len: 32
-  
-  fusion_space:
-    channels: 256
-    time_steps: 16
-    spatial_size: [14, 14]
-
-  foundation_models:
-    panecho:
-      enabled: true
-      out_channels: 768
-      out_spatial: [1, 1]
-    echoprime:
-      enabled: true
-      out_channels: 768
-      out_spatial: [7, 7]
 
 data: 
   name: "echonet"
@@ -24,8 +8,8 @@ data:
 
 training:
   epochs: 50
-  lr: 1.0e-4
-  batch_size: 12
+  lr: 1.2e-4
+  batch_size: 8
   train_batch_size: 64
   val_batch_size: 64
   num_workers: 12
@@ -50,4 +34,4 @@ loss:
     ef_weight_target: 1.0
 
 wandb:
-  enable: false
+  enable: true
