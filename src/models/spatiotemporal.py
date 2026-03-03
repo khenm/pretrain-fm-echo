@@ -83,8 +83,8 @@ class DirectVolumeRegressor(nn.Module):
         self.regressor = nn.Conv1d(hidden_dim, 1, kernel_size=1)
 
         # Polynomial Baseline Parameters
-        self.w1 = nn.Parameter(torch.tensor([100.0]))  # Initial linear scale
-        self.w2 = nn.Parameter(torch.tensor([10.0]))   # Initial quadratic scale
+        self.w1 = nn.Parameter(torch.tensor([1.5]))  # Initial linear scale
+        self.w2 = nn.Parameter(torch.tensor([2.0]))   # Initial quadratic scale
         self.beta = nn.Parameter(torch.tensor([0.0]))  # Global offset
 
     def forward(self, fused_features, mask_logits):
@@ -99,15 +99,15 @@ class DirectVolumeRegressor(nn.Module):
         mask_prob = torch.sigmoid(mask_logits)
         _, _, time_f, h_f, w_f = fused_features.shape
 
-        area_t = mask_prob.mean(dim=(3, 4)).squeeze(1) # Shape: (B, T)
-        
-        # Taylor Approximation: v_base = w1 * a + w2 * a^2 + beta
-        v_base = (self.w1 * area_t) + (self.w2 * (area_t ** 2)) + self.beta
-
-        if mask_prob.shape[-2:] != (h_f, w_f):
+        if mask_prob.shape[2:] != (time_f, h_f, w_f):
             mask_prob_s = F.adaptive_avg_pool3d(mask_prob, output_size=(time_f, h_f, w_f))
         else:
             mask_prob_s = mask_prob
+
+        area_t = mask_prob_s.mean(dim=(3, 4)).squeeze(1) # Shape: (B, T)
+        
+        # Taylor Approximation: v_base = w1 * a + w2 * a^2 + beta
+        v_base = (self.w1 * area_t) + (self.w2 * (area_t ** 2)) + self.beta
 
         # Multiply to ensure gradients flow EF -> Volume -> Segmentation Masks
         masked_features = fused_features * mask_prob_s
@@ -251,7 +251,7 @@ class SpatiotemporalEchoModel(nn.Module):
 
         pred_edv = vol_curve.max(dim=1)[0]
         pred_esv = vol_curve.min(dim=1)[0]
-        pred_ef = (pred_edv - pred_esv) / pred_edv.clamp(min=1e-3)
+        pred_ef = (pred_edv - pred_esv) / pred_edv.detach().clamp(min=1e-3)
 
         return {
             "mask_logits": mask_logits,
@@ -260,7 +260,7 @@ class SpatiotemporalEchoModel(nn.Module):
             "pred_edv": pred_edv,
             "pred_esv": pred_esv,
             "pred_ef": pred_ef,
-            "router_weights": None, # Removed unnecessary dynamic router overhead
+            "router_weights": None
         }
 
     @classmethod
