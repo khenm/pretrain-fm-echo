@@ -106,13 +106,6 @@ def sliding_window_inference(model, video_tensor, clip_len=16, overlap=0, device
     full_masks = torch.sigmoid(full_mask_logits) > 0.5
     full_masks = full_masks.cpu().numpy().astype(np.uint8)
     
-    if H > 112 and W > 112:
-        corrected_masks = np.zeros_like(full_masks)
-        for t in range(T):
-            top_left_mask = full_masks[t, :112, :112]
-            corrected_masks[t] = cv2.resize(top_left_mask, (W, H), interpolation=cv2.INTER_NEAREST)
-        full_masks = corrected_masks
-    
     return full_masks, full_vol_curve.cpu().numpy()
 
 def overlay_mask(image, mask, color=(0, 255, 0), alpha=0.4):

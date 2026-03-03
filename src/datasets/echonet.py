@@ -40,9 +40,9 @@ class EchoNetVideoDataset(Dataset):
         self.clips = self._generate_clips()
         
         # Targets lookup (still by filename, but accessed via clip index)
-        self.ef_targets = self._get_normalized_column("EF")
-        self.edv_targets = self._get_normalized_column("EDV")
-        self.esv_targets = self._get_normalized_column("ESV")
+        self.ef_targets = self._get_normalized_column("EF", 100.0)
+        self.edv_targets = self._get_normalized_column("EDV", 300.0)
+        self.esv_targets = self._get_normalized_column("ESV", 300.0)
         
         # Map filename to index in file_list for target retrieval
         self.fname_to_idx = {fname: i for i, fname in enumerate(self.file_list["FileName"].values)}
@@ -74,14 +74,9 @@ class EchoNetVideoDataset(Dataset):
         
         return df
 
-    def _get_normalized_column(self, col_name):
+    def _get_normalized_column(self, col_name, scale):
         if col_name in self.file_list.columns:
-            vals = self.file_list[col_name].values
-            if col_name == "EF":
-                return (vals - 55.7772746) / 12.4093964
-            elif col_name in ["EDV", "ESV"]:
-                return (vals - 67.2918115) / 47.6947210
-            return vals
+            return self.file_list[col_name].values / scale
         return np.full(len(self.file_list), -1.0 if "V" in col_name else 0.0)
 
     def _create_meta_lookup(self):
