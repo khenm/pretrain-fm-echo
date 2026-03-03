@@ -32,6 +32,9 @@ class SpatiotemporalLoss(nn.Module):
         self.esv_weight = esv_weight
         self.ef_weight = ef_weight
 
+        self.res_mag_weight = kwargs.get('res_mag_weight', 0.1)
+        self.res_smooth_weight = kwargs.get('res_smooth_weight', 1.0)
+
         self.dice_func = DiceCELoss(sigmoid=True, reduction='mean')
         self.l1_loss = nn.L1Loss(reduction='none')
 
@@ -71,7 +74,23 @@ class SpatiotemporalLoss(nn.Module):
                 loss_ef = self.l1_loss(pred_ef[valid_ef], target_ef[valid_ef]).mean()
 
         loss_vol = (self.edv_weight * loss_edv) + (self.esv_weight * loss_esv) + (self.ef_weight * loss_ef)
-        total_loss = (self.dice_weight * loss_dice) + (self.volume_weight * loss_vol)
+        
+        vol_residual = outputs.get('vol_residual')
+        loss_res_mag = torch.tensor(0.0, device=mask_logits.device)
+        loss_res_smooth = torch.tensor(0.0, device=mask_logits.device)
+
+        if vol_residual is not None:
+            # 1. Keep the residual small (prevent it from overriding the mask)
+            loss_res_mag = (vol_residual ** 2).mean()
+            
+            # 2. Keep the residual smooth (Second derivative penalty)
+            if vol_residual.shape[1] >= 3:
+                diff1 = vol_residual[:, 1:] - vol_residual[:, :-1]
+                diff2 = diff1[:, 1:] - diff1[:, :-1]
+                loss_res_smooth = diff2.abs().mean()
+
+        total_loss = (self.dice_weight * loss_dice) + (self.volume_weight * loss_vol) + \
+                     (self.res_mag_weight * loss_res_mag) + (self.res_smooth_weight * loss_res_smooth)
 
         loss_dict = {
             "loss": total_loss,
@@ -80,6 +99,8 @@ class SpatiotemporalLoss(nn.Module):
             "loss_edv": loss_edv.detach(),
             "loss_esv": loss_esv.detach(),
             "loss_ef": loss_ef.detach(),
+            "loss_res_mag": loss_res_mag.detach(),
+            "loss_res_smooth": loss_res_smooth.detach(),
         }
 
         return total_loss, loss_dict

@@ -82,6 +82,11 @@ class DirectVolumeRegressor(nn.Module):
         # Final projection to a single scalar volume per frame
         self.regressor = nn.Conv1d(hidden_dim, 1, kernel_size=1)
 
+        # Polynomial Baseline Parameters
+        self.w1 = nn.Parameter(torch.tensor([100.0]))  # Initial linear scale
+        self.w2 = nn.Parameter(torch.tensor([10.0]))   # Initial quadratic scale
+        self.beta = nn.Parameter(torch.tensor([0.0]))  # Global offset
+
     def forward(self, fused_features, mask_logits):
         """
         Args:
@@ -93,6 +98,11 @@ class DirectVolumeRegressor(nn.Module):
         """
         mask_prob = torch.sigmoid(mask_logits)
         _, _, time_f, h_f, w_f = fused_features.shape
+
+        area_t = mask_prob.mean(dim=(3, 4)).squeeze(1) # Shape: (B, T)
+        
+        # Taylor Approximation: v_base = w1 * a + w2 * a^2 + beta
+        v_base = (self.w1 * area_t) + (self.w2 * (area_t ** 2)) + self.beta
 
         if mask_prob.shape[-2:] != (h_f, w_f):
             mask_prob_s = F.adaptive_avg_pool3d(mask_prob, output_size=(time_f, h_f, w_f))
@@ -114,112 +124,32 @@ class DirectVolumeRegressor(nn.Module):
         x_seq = x_seq + self.temporal_engine(x_seq)
         
         # 4. Direct Frame-by-Frame Regression
-        vol_curve = self.regressor(x_seq).squeeze(1)   # (B, T)
+        residual_t = self.regressor(x_seq).squeeze(1)   # (B, T)
         
-        return vol_curve
-
-class SpatialProjectionAdapter(nn.Module):
-    """
-    For spatial feature maps (e.g. EchoPrime): (B,C,T,H,W) -> (B,C_shared,T,H_out,W_out)
-    """
-    def __init__(self, in_channels, out_channels, out_time, out_spatial=(14, 14)):
-        super().__init__()
-        self.out_time = out_time
-        self.out_spatial = out_spatial
-
-        self.temporal_smooth = nn.Conv3d(
-            in_channels, in_channels,
-            kernel_size=(3, 1, 1),
-            padding=(1, 0, 0),
-            groups=in_channels
-        )
-        self.channel_proj = nn.Conv3d(in_channels, out_channels, kernel_size=1)
-
-    def forward(self, x):
-        # interpolate time+space to target grid
-        x = F.interpolate(
-            x,
-            size=(self.out_time, self.out_spatial[0], self.out_spatial[1]),
-            mode="trilinear",
-            align_corners=False,
-        )
-        x = self.temporal_smooth(x)
-        x = self.channel_proj(x)
-        return x
-
-class GlobalContextAdapter(nn.Module):
-    """
-    For global streams (e.g. PanEcho): (B,C,T,1,1) -> context (B,C_shared,T)
-    No fake spatial upsampling.
-    """
-    def __init__(self, in_channels, out_channels, out_time):
-        super().__init__()
-        self.out_time = out_time
-
-        # time alignment + smoothing in (B,C,T)
-        self.proj = nn.Conv1d(in_channels, out_channels, kernel_size=1)
-        self.smooth = nn.Conv1d(out_channels, out_channels, kernel_size=5, padding=2, groups=out_channels)
-
-    def forward(self, x):
-        # x: (B,C,T,1,1) OR (B,C,T)
-        if x.dim() == 5:
-            x = x.squeeze(-1).squeeze(-1)  # (B,C,T)
-        # align T
-        if x.shape[-1] != self.out_time:
-            x = F.interpolate(x, size=self.out_time, mode="linear", align_corners=False)
-
-        x = self.proj(x)                  # (B,C_shared,T)
-        x = x + self.smooth(x)            # depthwise temporal smoothing (residual)
-        return x
-
+        vol_curve = v_base + residual_t
+        
+        return vol_curve, residual_t
 
 class FiLMFromGlobal(nn.Module):
     """
     Uses global context (B,Cg,T) to modulate spatial tensor (B,Cs,T,H,W).
+    Upgraded with Zero-Initialization to guarantee safe early-epoch training.
     """
     def __init__(self, global_channels, spatial_channels):
         super().__init__()
         self.to_gamma = nn.Conv1d(global_channels, spatial_channels, kernel_size=1)
         self.to_beta  = nn.Conv1d(global_channels, spatial_channels, kernel_size=1)
+        
+        # Zero-initialize the modulation weights
+        nn.init.zeros_(self.to_gamma.weight)
+        nn.init.zeros_(self.to_gamma.bias)
+        nn.init.zeros_(self.to_beta.weight)
+        nn.init.zeros_(self.to_beta.bias)
 
     def forward(self, spatial_x, global_ctx):
-        # spatial_x: (B,C,T,H,W)
-        # global_ctx: (B,Cg,T)
         gamma = self.to_gamma(global_ctx).unsqueeze(-1).unsqueeze(-1)  # (B,C,T,1,1)
         beta  = self.to_beta(global_ctx).unsqueeze(-1).unsqueeze(-1)   # (B,C,T,1,1)
         return spatial_x * (1.0 + torch.tanh(gamma)) + beta
-
-
-class MoFMRouter(nn.Module):
-    """
-    Generalized Context-Aware Collaborative Router for N Foundation Models.
-    Uses a 3x3x3 receptive field to ensure spatially coherent model assignment.
-    """
-    def __init__(self, num_models, shared_channels, hidden_dim=64):
-        super().__init__()
-        self.num_models = num_models
-        concat_channels = num_models * shared_channels
-        
-        self.net = nn.Sequential(
-            # Channel reduction
-            nn.Conv3d(concat_channels, hidden_dim, kernel_size=1),
-            nn.BatchNorm3d(hidden_dim),
-            nn.ReLU(inplace=True),
-            
-            # NEW: 3x3x3 Depthwise convolution for anatomical context
-            nn.Conv3d(hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=hidden_dim),
-            nn.BatchNorm3d(hidden_dim),
-            nn.ReLU(inplace=True),
-            
-            # Final routing weights
-            nn.Conv3d(hidden_dim, num_models, kernel_size=1)
-        )
-
-    def forward(self, projected_features):
-        concat_features = torch.cat(projected_features, dim=1)
-        logits = self.net(concat_features) # (B, N, T, H, W)
-        return F.softmax(logits, dim=1)
-
 
 @register_model("SpatiotemporalEchoModel")
 class SpatiotemporalEchoModel(nn.Module):
@@ -252,45 +182,25 @@ class SpatiotemporalEchoModel(nn.Module):
             self.backbones[name] = backbone
             logger.info(f"Loaded FM backbone: {registry_name}")
         
-        # 1. Dynamic Adapter Factory
-        self.adapters = nn.ModuleDict()
-        self.fm_out_spatial = {}
+        # 1. Inline Normalized Projections
+        panecho_dim = fm_configs.get('panecho', {}).get('out_channels', 768)
+        echoprime_dim = fm_configs.get('echoprime', {}).get('out_channels', 768)
 
-        for name in self.fm_names:
-            fm_cfg = fm_configs[name]
-            in_channels = fm_cfg.get('out_channels')
-            if in_channels is None:
-                raise ValueError(f"Config for foundation model {name} must specify out_channels.")
-
-            out_spatial = tuple(fm_cfg.get("out_spatial", (7, 7)))
-            self.fm_out_spatial[name] = out_spatial
-
-            # PanEcho config has out_spatial [1,1] in your YAML :contentReference[oaicite:2]{index=2}
-            if out_spatial == (1, 1):
-                self.adapters[name] = GlobalContextAdapter(
-                    in_channels=in_channels,
-                    out_channels=self.shared_channels,
-                    out_time=self.out_time
-                )
-            else:
-                self.adapters[name] = SpatialProjectionAdapter(
-                    in_channels=in_channels,
-                    out_channels=self.shared_channels,
-                    out_time=self.out_time,
-                    out_spatial=self.out_spatial
-                )
+        self.panecho_proj = nn.Sequential(
+            nn.Conv1d(panecho_dim, self.shared_channels, kernel_size=1),
+            nn.GroupNorm(num_groups=min(32, self.shared_channels), num_channels=self.shared_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.echoprime_proj = nn.Sequential(
+            nn.Conv3d(echoprime_dim, self.shared_channels, kernel_size=1),
+            nn.GroupNorm(num_groups=min(32, self.shared_channels), num_channels=self.shared_channels),
+            nn.ReLU(inplace=True)
+        )
 
         # global->spatial conditioning
         self.film = FiLMFromGlobal(global_channels=self.shared_channels, spatial_channels=self.shared_channels)
-            
-        # 2. Voxel-Wise Router
-        self.router = MoFMRouter(
-            num_models=self.num_models,
-            shared_channels=self.shared_channels,
-            hidden_dim=64
-        )
         
-        # 3. Task Heads
         self.decoder = SpatiotemporalDecoder(in_channels=self.shared_channels, out_channels=num_classes)
         self.volume_head = DirectVolumeRegressor(in_channels=self.shared_channels, hidden_dim=512)
 
@@ -304,51 +214,40 @@ class SpatiotemporalEchoModel(nn.Module):
     def forward(self, video):
         """
         End-to-end forward: raw video → FM extraction → fusion → task heads.
-
-        Args:
-            video (Tensor): Raw video tensor (B, C, T, H, W).
         """
         fm_features = self._extract_fm_features(video)
-        spatial_feats = []
-        global_ctxs = []
 
-        spatial_names = []
-        global_names = []
-
-        for name in self.fm_names:
-            raw_feat = fm_features[name]
-            out_spatial = self.fm_out_spatial.get(name, (7, 7))
-
-            if out_spatial == (1, 1):
-                ctx = self.adapters[name](raw_feat)
-                global_ctxs.append(ctx)
-                global_names.append(name)
-            else:
-                s = self.adapters[name](raw_feat)
-                spatial_feats.append(s)
-                spatial_names.append(name)
-
-        if len(spatial_feats) == 0:
-            raise RuntimeError("No spatial foundation model features available (need at least one like EchoPrime).")
-
-        if len(spatial_feats) == 1:
-            fused_spatial = spatial_feats[0]
-            router_weights = None
+        # 1. PanEcho minimal processing (Global Context)
+        if 'panecho' in fm_features:
+            panecho_feat = fm_features['panecho']  # (B, C, T) directly from updated wrapper
+            if panecho_feat.shape[-1] != self.out_time:
+                panecho_feat = F.interpolate(panecho_feat, size=self.out_time, mode="linear", align_corners=False)
+            global_ctx = self.panecho_proj(panecho_feat) # (B, 256, 16)
         else:
-            router_weights = self.router(spatial_feats)  # (B, N_spatial, T, H, W)
-            fused_spatial = torch.zeros_like(spatial_feats[0])
-            for i, s in enumerate(spatial_feats):
-                w = router_weights[:, i:i+1]
-                fused_spatial = fused_spatial + s * w
+            global_ctx = None
 
-        if len(global_ctxs) > 0:
-            global_ctx = torch.stack(global_ctxs, dim=0).mean(dim=0)  # (B,C_shared,T)
+        # 2. EchoPrime minimal processing (Spatial Features)
+        if 'echoprime' in fm_features:
+            spatial_feat = fm_features['echoprime'] # (B, C, T, H, W)
+            spatial_feat = F.interpolate(
+                spatial_feat, 
+                size=(self.out_time, self.out_spatial[0], self.out_spatial[1]), 
+                mode="trilinear", 
+                align_corners=False
+            )
+            fused_spatial = self.echoprime_proj(spatial_feat) # (B, 256, 16, 14, 14)
+        else:
+            raise RuntimeError("EchoPrime spatial features are required.")
+
+        # 3. Direct Fusion via FiLM
+        if global_ctx is not None:
             fused_features = self.film(fused_spatial, global_ctx)
         else:
             fused_features = fused_spatial
 
+        # Task Heads
         mask_logits = self.decoder(fused_features)
-        vol_curve = self.volume_head(fused_features, mask_logits)
+        vol_curve, vol_residual = self.volume_head(fused_features, mask_logits)
 
         pred_edv = vol_curve.max(dim=1)[0]
         pred_esv = vol_curve.min(dim=1)[0]
@@ -357,10 +256,11 @@ class SpatiotemporalEchoModel(nn.Module):
         return {
             "mask_logits": mask_logits,
             "vol_curve": vol_curve,
+            "vol_residual": vol_residual,
             "pred_edv": pred_edv,
             "pred_esv": pred_esv,
             "pred_ef": pred_ef,
-            "router_weights": router_weights,
+            "router_weights": None, # Removed unnecessary dynamic router overhead
         }
 
     @classmethod

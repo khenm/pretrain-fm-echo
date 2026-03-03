@@ -52,6 +52,39 @@ class LossWeightScheduler:
                     
                     logger.info(f"\u2696\ufe0f Loss Topology Update: Set '{name}' {self.target_attr} to {self.current_weight:.4f}")
 
+class ResidualDecayScheduler:
+    """
+    Decays the residual magnitude penalty to slowly unleash the 
+    1D temporal engine.
+    """
+    def __init__(self, criterions_dict, start_epoch=10, end_epoch=30, max_weight=1.0, min_weight=0.01):
+        self.criterions_dict = criterions_dict
+        self.start_epoch = start_epoch
+        self.end_epoch = end_epoch
+        self.max_weight = max_weight
+        self.min_weight = min_weight
+        self.current_weight = max_weight
+
+    def step(self, epoch):
+        if epoch <= self.start_epoch:
+            new_weight = self.max_weight
+        elif epoch >= self.end_epoch:
+            new_weight = self.min_weight
+        else:
+            progress = (epoch - self.start_epoch) / (self.end_epoch - self.start_epoch)
+            new_weight = self.max_weight - progress * (self.max_weight - self.min_weight)
+
+        if new_weight != self.current_weight:
+            self.current_weight = new_weight
+            for name, criterion in self.criterions_dict.items():
+                if hasattr(criterion, 'res_mag_weight'):
+                    if isinstance(getattr(criterion, 'res_mag_weight'), torch.Tensor):
+                        getattr(criterion, 'res_mag_weight').fill_(self.current_weight)
+                    else:
+                        setattr(criterion, 'res_mag_weight', self.current_weight)
+                    
+                    logger.info(f"⚖️ Residual Decay Update: Set '{name}' res_mag_weight to {self.current_weight:.4f}")
+
 class Trainer:
     """
     Handles generic training and validation across unified architectures.
@@ -78,6 +111,16 @@ class Trainer:
             end_epoch=scheduler_cfg.get('end_epoch', 20),
             max_weight=self.cfg.get('loss', {}).get('kwargs', {}).get('ef_weight_target', 1.0)
         )
+        
+        res_decay_cfg = self.cfg.get('training', {}).get('res_decay', {})
+        self.res_scheduler = ResidualDecayScheduler(
+            criterions_dict=self.criterions,
+            start_epoch=res_decay_cfg.get('start_epoch', 10),
+            end_epoch=res_decay_cfg.get('end_epoch', 30),
+            max_weight=self.cfg.get('loss', {}).get('kwargs', {}).get('res_mag_weight', 1.0),
+            min_weight=self.cfg.get('loss', {}).get('kwargs', {}).get('res_mag_weight_min', 0.01)
+        )
+        
         self.val_metrics = metrics or {}
         import copy
         self.train_metrics = {k: v.clone() if hasattr(v, 'clone') else copy.deepcopy(v) for k, v in self.val_metrics.items()}
@@ -158,6 +201,7 @@ class Trainer:
 
         for ep in range(start_ep, epochs + 1):
             self.loss_scheduler.step(ep)
+            self.res_scheduler.step(ep)
             
             if hasattr(self.ld_tr, 'sampler') and hasattr(self.ld_tr.sampler, 'set_epoch'):
                 self.ld_tr.sampler.set_epoch(ep)
@@ -462,7 +506,8 @@ class Trainer:
     def _load_checkpoint(self, path):
         """Delegates loading to the State Manager."""
         if self.state:
-            self.state.load(path, self.model, optimizer=self.opt, scaler=self.scaler)
+            model_to_load = self.model.module if hasattr(self.model, 'module') else self.model
+            self.state.load(path, model_to_load, optimizer=self.opt, scaler=self.scaler)
             return self.state.current_epoch, self.state.best_metric
         return 1, -float('inf')
 

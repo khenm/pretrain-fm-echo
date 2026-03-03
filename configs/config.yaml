@@ -7,7 +7,7 @@ data:
   target_key: "batch"
 
 training:
-  epochs: 50
+  epochs: 100
   lr: 1.2e-4
   batch_size: 8
   train_batch_size: 64
@@ -22,6 +22,9 @@ training:
   checkpoint_dir: "/workspace/checkpoints"
   resume_path: null
   pretrain: true
+  res_decay:
+    start_epoch: 10
+    end_epoch: 30
 
 loss:
   types: ["SpatiotemporalLoss"]
@@ -32,6 +35,9 @@ loss:
     esv_weight: 1.0
     ef_weight: 0.0
     ef_weight_target: 1.0
+    res_mag_weight: 1.0
+    res_mag_weight_min: 0.01
+    res_smooth_weight: 1.0
 
 wandb:
   enable: true

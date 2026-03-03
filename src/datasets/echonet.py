@@ -152,9 +152,11 @@ class EchoNetVideoDataset(Dataset):
     def _generate_mask(points, height, width):
         mask = np.zeros((height, width), dtype=np.uint8)
         points = points.iloc[1:] 
+        scale_x = width / 112.0
+        scale_y = height / 112.0
         pts = np.stack([
-            np.concatenate([points["X1"].values, points["X2"].values[::-1]]),
-            np.concatenate([points["Y1"].values, points["Y2"].values[::-1]])
+            np.concatenate([points["X1"].values * scale_x, points["X2"].values[::-1] * scale_x]),
+            np.concatenate([points["Y1"].values * scale_y, points["Y2"].values[::-1] * scale_y])
         ], axis=1).astype(np.int32)
         cv2.fillPoly(mask, [pts], 1)
         return mask
