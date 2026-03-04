@@ -34,6 +34,36 @@ def load_video(video_path, img_size=(224, 224)):
     cap.release()
     return frames, fps
 
+def _compute_vol_curve(mask_logits: torch.Tensor) -> torch.Tensor:
+    import math
+    masks_for_vol = (torch.sigmoid(mask_logits) > 0.5).squeeze(0).squeeze(0)
+    masks_np = masks_for_vol.cpu().numpy().astype(np.uint8)
+    
+    vol_curve_list = []
+    for mask_idx in range(masks_np.shape[0]):
+        area = float(masks_np[mask_idx].sum())
+        if area == 0:
+            vol_curve_list.append(0.0)
+            continue
+            
+        contours, _ = cv2.findContours(masks_np[mask_idx], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            length = 1.0
+        else:
+            contour = max(contours, key=cv2.contourArea)
+            if len(contour) >= 5:
+                _, (major_axis, minor_axis), _ = cv2.fitEllipse(contour)
+                length = max(major_axis, minor_axis)
+            else:
+                rect = cv2.minAreaRect(contour)
+                length = max(rect[1][0], rect[1][1])
+            length = max(length, 1e-3)
+            
+        volume = (8.0 * (area ** 2)) / (3.0 * math.pi * length)
+        vol_curve_list.append(volume)
+        
+    return torch.tensor(vol_curve_list, device=mask_logits.device, dtype=torch.float32).unsqueeze(0)
+
 def sliding_window_inference(model, video_tensor, clip_len=16, overlap=0, device="cuda"):
     """
     Runs sliding window inference on the full video tensor.
@@ -51,23 +81,20 @@ def sliding_window_inference(model, video_tensor, clip_len=16, overlap=0, device
     """
     model.eval()
     
-    B, C, T, H, W = video_tensor.shape
+    _, _, T, H, W = video_tensor.shape
     stride = max(1, clip_len - overlap)
     
-    # Store results
-    full_mask_logits = torch.zeros((T, H, W), device=device) # (T, H, W)
-    full_vol_curve = torch.zeros((T,), device=device) # (T,)
+    full_mask_logits = torch.zeros((T, H, W), device=device)
+    full_vol_curve = torch.zeros((T,), device=device)
     counts = torch.zeros((T,), device=device)
     
     with torch.no_grad():
         for start_idx in range(0, T, stride):
             end_idx = min(start_idx + clip_len, T)
             
-            # If the chunk is smaller than clip_len, we might need to pad it to fit the model's expected clip_len.
             chunk = video_tensor[:, :, start_idx:end_idx, :, :]
             actual_len = chunk.shape[2]
             
-            pad_len = 0
             if actual_len < clip_len:
                 pad_len = clip_len - actual_len
                 pad_tensor = chunk[:, :, -1:].expand(-1, -1, pad_len, -1, -1)
@@ -75,98 +102,47 @@ def sliding_window_inference(model, video_tensor, clip_len=16, overlap=0, device
                 
             outputs = model(chunk)
             
-            mask_logits = outputs["mask_logits"] # (1, 1, T_clip, H, W)
-            if "vol_curve" in outputs:
-                vol_curve = outputs["vol_curve"]     # (1, T_clip)
-            else:
-                import math
-                T_curr = mask_logits.shape[2]
-                # mask_logits is (1, 1, T_clip, H, W). We compute over T_clip
-                masks_for_vol = (torch.sigmoid(mask_logits) > 0.5).squeeze(0).squeeze(0)
-                masks_np = masks_for_vol.cpu().numpy().astype(np.uint8)
-                vol_curve_list = []
-                for idx in range(T_curr):
-                    A_t = float(masks_np[idx].sum())
-                    if A_t == 0:
-                        vol_curve_list.append(0.0)
-                    else:
-                        contours, _ = cv2.findContours(masks_np[idx], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                        if not contours:
-                            L_t = 1.0
-                        else:
-                            c = max(contours, key=cv2.contourArea)
-                            if len(c) >= 5:
-                                _, (MA, ma), _ = cv2.fitEllipse(c)
-                                L_t = max(MA, ma)
-                            else:
-                                rect = cv2.minAreaRect(c)
-                                L_t = max(rect[1][0], rect[1][1])
-                            L_t = max(L_t, 1e-3)
-                        v_t = (8.0 * (A_t ** 2)) / (3.0 * math.pi * L_t)
-                        vol_curve_list.append(v_t)
-                vol_curve = torch.tensor(vol_curve_list, device=mask_logits.device, dtype=torch.float32).unsqueeze(0) # (1, T_clip)
+            mask_logits = outputs["mask_logits"]
+            vol_curve = outputs.get("vol_curve", _compute_vol_curve(mask_logits))
             
-            mask_logits_req = mask_logits # (1, 1, T_clip, H', W')
-            if mask_logits_req.shape[2:] != (clip_len, H, W):
-                mask_logits = F.interpolate(mask_logits_req, size=(clip_len, H, W), mode='trilinear', align_corners=False)
-            else:
-                mask_logits = mask_logits_req
-            mask_logits = mask_logits.squeeze(0).squeeze(0) # (clip_len, H, W)
+            if mask_logits.shape[2:] != (clip_len, H, W):
+                mask_logits = F.interpolate(mask_logits, size=(clip_len, H, W), mode='trilinear', align_corners=False)
+            mask_logits = mask_logits.squeeze(0).squeeze(0)
             
-            vol_curve = vol_curve.unsqueeze(0) # (1, 1, T_clip)
+            vol_curve = vol_curve.unsqueeze(0)
             if vol_curve.shape[2] != clip_len:
                 vol_curve = F.interpolate(vol_curve, size=clip_len, mode='linear', align_corners=False)
-            vol_curve = vol_curve.squeeze(0).squeeze(0) # (clip_len,)
+            vol_curve = vol_curve.squeeze(0).squeeze(0)
             
-            # Aggregate
-            valid_len = actual_len
-            full_mask_logits[start_idx:end_idx] += mask_logits[:valid_len]
-            full_vol_curve[start_idx:end_idx] += vol_curve[:valid_len]
+            full_mask_logits[start_idx:end_idx] += mask_logits[:actual_len]
+            full_vol_curve[start_idx:end_idx] += vol_curve[:actual_len]
             counts[start_idx:end_idx] += 1
 
-    # Average overlaps
     full_mask_logits = full_mask_logits / counts.unsqueeze(-1).unsqueeze(-1)
     full_vol_curve = full_vol_curve / counts
     
-    full_masks = torch.sigmoid(full_mask_logits) > 0.5
-    full_masks = full_masks.cpu().numpy().astype(np.uint8)
-    
+    full_masks = (torch.sigmoid(full_mask_logits) > 0.5).cpu().numpy().astype(np.uint8)
     return full_masks, full_vol_curve.cpu().numpy()
 
-def overlay_mask(image, mask, color=(0, 255, 0), alpha=0.4):
-    """
-    Overlays a binary mask on an RGB image.
-    """
+def overlay_mask(image: np.ndarray, mask: np.ndarray, color: tuple[int, int, int] = (0, 255, 0), alpha: float = 0.4) -> np.ndarray:
+    """Overlays a binary mask on an RGB image."""
     overlay = image.copy()
     for c in range(3):
         overlay[:, :, c] = np.where(mask > 0, image[:, :, c] * (1 - alpha) + color[c] * alpha, image[:, :, c])
     return overlay.astype(np.uint8)
 
-def render_live_plot(frames, masks, vol_curve, output_path, fps=30.0, video_size=(224, 224)):
-    """
-    Generates a live video plot with segmentation masks and a volume curve.
-    
-    Args:
-        frames: list of numpy arrays (H, W, 3) representing the original video frames.
-        masks: (T, H, W) numpy array of binary masks.
-        vol_curve: (T,) numpy array of volume estimates.
-        output_path: path to save the output video (.mp4).
-        fps: output frames per second.
-        video_size: spatial size of the video.
-    """
+def render_live_plot(frames: list[np.ndarray], masks: np.ndarray, vol_curve: np.ndarray, output_path: str, fps: float = 30.0, video_size: tuple[int, int] = (224, 224), gt_mask: np.ndarray | None = None) -> None:
     T = len(frames)
     if T == 0:
         return
         
     H, W = frames[0].shape[:2]
     
-    # Identify ED (End-Diastole, max volume) and ES (End-Systole, min volume)
     ed_frame = np.argmax(vol_curve)
     es_frame = np.argmin(vol_curve)
     
-    # Plot configuration
-    plot_h, plot_w = 200, 448 # W*2 typically for side-by-side or matched width
-    out_w = W * 2 # Original | Overlaid
+    plot_h, plot_w = 200, 448 
+    out_w = W * 2 
     out_h = H + plot_h
     
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -176,17 +152,20 @@ def render_live_plot(frames, masks, vol_curve, output_path, fps=30.0, video_size
         frame = frames[t]
         mask = masks[t]
         
-        # Side-by-side: original vs mask overlaid
+        left_frame = frame.copy()
+        if gt_mask is not None and t < len(gt_mask):
+            gt_frame_mask = gt_mask[t]
+            if np.any(gt_frame_mask):
+                left_frame = overlay_mask(left_frame, gt_frame_mask, color=(255, 0, 0), alpha=0.5)
+                
         overlaid_frame = overlay_mask(frame, mask, color=(0, 255, 0), alpha=0.5)
-        top_row = np.concatenate([frame, overlaid_frame], axis=1) # (H, W*2, 3)
+        top_row = np.concatenate([left_frame, overlaid_frame], axis=1)
         
-        # Bottom row: Volume curve
         fig, ax = plt.subplots(figsize=(out_w / 100, plot_h / 100), dpi=100)
         ax.plot(range(T), vol_curve, color='blue', label='Volume Curve', alpha=0.5)
         ax.plot(range(t+1), vol_curve[:t+1], color='red', linewidth=2)
         ax.scatter([t], [vol_curve[t]], color='red', s=50, zorder=5)
         
-        # Annotate ED and ES frames
         ax.axvline(x=ed_frame, color='green', linestyle='--', label=f'ED (Frame {ed_frame})')
         ax.axvline(x=es_frame, color='purple', linestyle='--', label=f'ES (Frame {es_frame})')
         ax.legend(loc='upper right', fontsize='small')
@@ -194,8 +173,7 @@ def render_live_plot(frames, masks, vol_curve, output_path, fps=30.0, video_size
         ax.set_xlim(0, max(T-1, 1))
         
         min_vol, max_vol = np.min(vol_curve), np.max(vol_curve)
-        margin = (max_vol - min_vol) * 0.1
-        if margin == 0: margin = 10
+        margin = max((max_vol - min_vol) * 0.1, 10)
         ax.set_ylim(min_vol - margin, max_vol + margin)
         
         ax.set_title(f"Volume: {vol_curve[t]:.2f}")
@@ -204,22 +182,18 @@ def render_live_plot(frames, masks, vol_curve, output_path, fps=30.0, video_size
         ax.grid(True, linestyle='--', alpha=0.7)
         plt.tight_layout()
         
-        # Render plot to numpy array
         canvas = FigureCanvas(fig)
         canvas.draw()
         plot_img = np.frombuffer(canvas.buffer_rgba(), dtype=np.uint8)
         plot_img = plot_img.reshape(fig.canvas.get_width_height()[::-1] + (4,))
-        plot_img = plot_img[:, :, :3] # keep RGB
+        plot_img = plot_img[:, :, :3]
         plt.close(fig)
         
-        # resize plot_img to exactly (plot_h, out_w) if not already
         if plot_img.shape[:2] != (plot_h, out_w):
             plot_img = cv2.resize(plot_img, (out_w, plot_h))
             
-        # Combine
-        final_frame = np.concatenate([top_row, plot_img], axis=0) # (H+plot_h, W*2, 3)
+        final_frame = np.concatenate([top_row, plot_img], axis=0) 
         
-        # OpenCV uses BGR for writing
         final_frame_bgr = cv2.cvtColor(final_frame, cv2.COLOR_RGB2BGR)
         out_video.write(final_frame_bgr)
         

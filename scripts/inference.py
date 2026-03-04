@@ -11,6 +11,7 @@ def parse_args():
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to the model checkpoint (.pt) file.")
     parser.add_argument("--video", type=str, required=True, help="Path to the input video file (e.g., .avi or .mp4).")
     parser.add_argument("--result", type=str, default="results", help="Directory to save the resulting output.mp4. Default is /results")
+    parser.add_argument("--data_dir", type=str, default="datasets/echonet-dynamic", help="Path to the dataset directory containing VolumeTracings.csv.")
     parser.add_argument("--return_masks", action="store_true", help="If passed, will save the segmentation masks and volume curve to disk.")
     
     return parser.parse_args()

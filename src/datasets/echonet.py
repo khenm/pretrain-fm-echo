@@ -126,18 +126,17 @@ class EchoNetVideoDataset(Dataset):
                 if ed_frame == -1 or es_frame == -1:
                     continue
                     
-                # Check if BOTH frames are strictly within (start, end-1)
-                has_ed = (start < ed_frame < end - 1)
-                has_es = (start < es_frame < end - 1)
-                    
-                if not (has_ed and has_es):
-                    continue
+                if self.pretrain:
+                    has_ed = (start < ed_frame < end - 1)
+                    has_es = (start < es_frame < end - 1)
                         
-                # Smart Padding Logic
+                    if not (has_ed and has_es):
+                        continue
+                        
                 if end > total_frames:
                     pad_len = end - total_frames
                     if pad_len > (0.2 * self.max_clip_len):
-                        continue # Drop clip if padding exceeds 20%
+                        continue
                         
                 # Stop if we went way past (redundant with continue, but keeps logic clean)
                 if start >= total_frames:
