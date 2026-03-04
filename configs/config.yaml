@@ -9,7 +9,7 @@ data:
 training:
   epochs: 100
   lr: 1.2e-4
-  batch_size: 16
+  batch_size: 8
   train_batch_size: 64
   val_batch_size: 64
   num_workers: 12
@@ -21,8 +21,7 @@ training:
   save_dir: "/workspace/runs"
   checkpoint_dir: "/workspace/checkpoints"
   resume_path: null
-  pretrain: true
-  dice_only_epochs: 10
+  pretrain: false
 
 loss:
   types: ["SpatiotemporalLoss"]
