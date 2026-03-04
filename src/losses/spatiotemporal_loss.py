@@ -38,6 +38,16 @@ class SpatiotemporalLoss(nn.Module):
         target_masks = targets['label']
         label_mask = targets['frame_mask']
 
+        if mask_logits.shape[-2:] != target_masks.shape[-2:]:
+            target_size = target_masks.shape[-2:]
+            mask_logits = F.interpolate(
+                mask_logits, size=(mask_logits.shape[2], *target_size),
+                mode='trilinear', align_corners=False
+            )
+
+        if mask_logits.shape[1] == 1 and mask_logits.shape[2] > 1:
+            mask_logits = mask_logits.permute(0, 2, 1, 3, 4)
+
         loss_dice = self._compute_dice_loss(mask_logits, target_masks, label_mask)
 
         total_loss = self.dice_weight * loss_dice
@@ -48,7 +58,18 @@ class SpatiotemporalLoss(nn.Module):
         }
 
         if 'flow' in targets and self.flow_weight > 0:
-            loss_flow = self.flow_func(mask_logits, targets['flow'], label_mask)
+            flow_target = targets['flow']
+            if flow_target.shape[-2:] != mask_logits.shape[-2:]:
+                B, T_minus_1, C_flow, H_f, W_f = flow_target.shape
+                flow_target = flow_target.view(B, T_minus_1 * C_flow, H_f, W_f)
+                flow_target = F.interpolate(flow_target, size=mask_logits.shape[-2:], mode='bilinear', align_corners=False)
+                scale_h = mask_logits.shape[-2] / H_f
+                scale_w = mask_logits.shape[-1] / W_f
+                flow_target = flow_target.view(B, T_minus_1, C_flow, *mask_logits.shape[-2:])
+                flow_target[:, :, 0, :, :] *= scale_w
+                flow_target[:, :, 1, :, :] *= scale_h
+
+            loss_flow = self.flow_func(mask_logits, flow_target, None)
             total_loss += self.flow_weight * loss_flow
             loss_dict['flow_loss'] = loss_flow.detach()
             loss_dict['loss'] = total_loss
@@ -57,16 +78,6 @@ class SpatiotemporalLoss(nn.Module):
 
     def _compute_dice_loss(self, pred_logits, target_masks, frame_mask):
         """Vectorized Dice+CE on valid labeled frames."""
-        if pred_logits.shape[-2:] != target_masks.shape[-2:]:
-            target_size = target_masks.shape[-2:]
-            pred_logits = F.interpolate(
-                pred_logits, size=(pred_logits.shape[2], *target_size),
-                mode='trilinear', align_corners=False
-            )
-
-        if pred_logits.shape[1] == 1 and pred_logits.shape[2] > 1:
-            pred_logits = pred_logits.permute(0, 2, 1, 3, 4)
-
         if target_masks.shape[1] == 1 and target_masks.shape[2] > 1:
             target_masks = target_masks.permute(0, 2, 1, 3, 4)
 

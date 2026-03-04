@@ -51,21 +51,18 @@ class FlowConsistencyLoss(nn.Module):
         if T < 2:
             return 0.0 * mask_logits.sum()
 
-        # Convert logits to probabilities
         soft_masks = torch.sigmoid(mask_logits)
         
-        mask_t = soft_masks[:, :-1].reshape(-1, C, H, W)         # Frames 0 to T-2
-        mask_t_plus_1 = soft_masks[:, 1:].reshape(-1, C, H, W)   # Frames 1 to T-1
+        mask_t = soft_masks[:, :-1].reshape(-1, C, H, W)         
+        mask_t_plus_1 = soft_masks[:, 1:].reshape(-1, C, H, W)   
         
         flow_flat = flow.reshape(-1, 2, H, W)
-        
-        # Warp mask_t forwards to match the position at t+1
-        warped_mask_t = self._warp(mask_t, flow_flat)
+        warped_mask_t_plus_1 = self._warp(mask_t_plus_1, flow_flat)
         
         if self.loss_type == 'l1':
-            loss = F.l1_loss(warped_mask_t, mask_t_plus_1, reduction='none')
+            loss = F.l1_loss(warped_mask_t_plus_1, mask_t, reduction='none')
         elif self.loss_type == 'l2':
-            loss = F.mse_loss(warped_mask_t, mask_t_plus_1, reduction='none')
+            loss = F.mse_loss(warped_mask_t_plus_1, mask_t, reduction='none')
         else:
             raise ValueError(f"Unknown loss type {self.loss_type}")
 

@@ -70,16 +70,41 @@ def sliding_window_inference(model, video_tensor, clip_len=16, overlap=0, device
             pad_len = 0
             if actual_len < clip_len:
                 pad_len = clip_len - actual_len
-                # Pad repeating the last frame or zero padding
-                # Depending on how the model was trained, zero-padding might be safer, or edge padding.
-                # using replication of last frame:
                 pad_tensor = chunk[:, :, -1:].expand(-1, -1, pad_len, -1, -1)
                 chunk = torch.cat([chunk, pad_tensor], dim=2)
                 
             outputs = model(chunk)
             
             mask_logits = outputs["mask_logits"] # (1, 1, T_clip, H, W)
-            vol_curve = outputs["vol_curve"]     # (1, T_clip)
+            if "vol_curve" in outputs:
+                vol_curve = outputs["vol_curve"]     # (1, T_clip)
+            else:
+                import math
+                T_curr = mask_logits.shape[2]
+                # mask_logits is (1, 1, T_clip, H, W). We compute over T_clip
+                masks_for_vol = (torch.sigmoid(mask_logits) > 0.5).squeeze(0).squeeze(0)
+                masks_np = masks_for_vol.cpu().numpy().astype(np.uint8)
+                vol_curve_list = []
+                for idx in range(T_curr):
+                    A_t = float(masks_np[idx].sum())
+                    if A_t == 0:
+                        vol_curve_list.append(0.0)
+                    else:
+                        contours, _ = cv2.findContours(masks_np[idx], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        if not contours:
+                            L_t = 1.0
+                        else:
+                            c = max(contours, key=cv2.contourArea)
+                            if len(c) >= 5:
+                                _, (MA, ma), _ = cv2.fitEllipse(c)
+                                L_t = max(MA, ma)
+                            else:
+                                rect = cv2.minAreaRect(c)
+                                L_t = max(rect[1][0], rect[1][1])
+                            L_t = max(L_t, 1e-3)
+                        v_t = (8.0 * (A_t ** 2)) / (3.0 * math.pi * L_t)
+                        vol_curve_list.append(v_t)
+                vol_curve = torch.tensor(vol_curve_list, device=mask_logits.device, dtype=torch.float32).unsqueeze(0) # (1, T_clip)
             
             mask_logits_req = mask_logits # (1, 1, T_clip, H', W')
             if mask_logits_req.shape[2:] != (clip_len, H, W):

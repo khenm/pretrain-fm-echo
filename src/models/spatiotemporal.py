@@ -15,7 +15,7 @@ class SpatiotemporalDecoder(nn.Module):
         out_channels (int): Output feature channels (e.g., number of semantic classes).
         hidden_dims (list[int]): Feature channels for each transposed convolution layer.
     """
-    def __init__(self, in_channels, out_channels=1, hidden_dims=[128, 64, 32, 16]):
+    def __init__(self, in_channels, out_channels=1, hidden_dims=[256, 128, 64, 32, 16]):
         super().__init__()
         layers = []
         current_channels = in_channels

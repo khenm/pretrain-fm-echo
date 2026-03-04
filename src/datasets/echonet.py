@@ -49,7 +49,7 @@ class EchoNetVideoDataset(Dataset):
         # Map filename to index in file_list for target retrieval
         self.fname_to_idx = {fname: i for i, fname in enumerate(self.file_list["FileName"].values)}
         
-        logger.info(f"EchoNetVideoDataset initialized: Split={self.split}, Clips={len(self.clips)}, Videos={len(self.file_list)}")
+        logger.info(f"EchoNetVideoDataset initialized: Split={self.split}, Clips={len(self.clips)}, Videos={len(self.file_list)}, FlowDir={self.flow_dir}")
 
     def _load_file_list(self):
         fname_w_frames = "FileListwFrames112.csv"
