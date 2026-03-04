@@ -1,13 +1,12 @@
 import torch
-from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
+from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 import torch.nn.functional as F
 
 class RAFTFlowEstimator:
     def __init__(self, device='cuda' if torch.cuda.is_available() else 'cpu'):
         self.device = device
-        # Use small weights for faster inference. We just need motion priors, not pixel-perfect flow
-        self.weights = Raft_Small_Weights.DEFAULT
-        self.model = raft_small(weights=self.weights, progress=False).to(self.device)
+        self.weights = Raft_Large_Weights.DEFAULT
+        self.model = raft_large(weights=self.weights, progress=False).to(self.device)
         self.model.eval()
         self.transforms = self.weights.transforms()
 
@@ -25,9 +24,6 @@ class RAFTFlowEstimator:
         T, C, H, W = video_tensor.shape
         if T < 2:
             return torch.zeros((0, 2, H, W), device=video_tensor.device)
-            
-        # RAFT expects inputs in [-1, 1] usually, but torchvision transforms handles the normalization 
-        # from typical [0, 1] or [0, 255] float tensors.
         
         # Ensure tensor is scaled [0, 1] if it looks like [0, 255]
         if video_tensor.max() > 1.0:
@@ -39,9 +35,16 @@ class RAFTFlowEstimator:
         img1_batch = video_tensor[:-1] # [0, 1, ..., T-2]
         img2_batch = video_tensor[1:]  # [1, 2, ..., T-1]
         
-        # Apply torchvision's specific RAFT transforms
-        # The transform expects [0,1] or [0,255] uint8. It returns [-1, 1].
         img1_batch, img2_batch = self.transforms(img1_batch, img2_batch)
+
+        pad_h = max(128 - H, 0)
+        pad_w = max(128 - W, 0)
+        pad_h = pad_h + (8 - (H + pad_h) % 8) % 8
+        pad_w = pad_w + (8 - (W + pad_w) % 8) % 8
+        
+        if pad_h > 0 or pad_w > 0:
+            img1_batch = F.pad(img1_batch, (0, pad_w, 0, pad_h), mode='replicate')
+            img2_batch = F.pad(img2_batch, (0, pad_w, 0, pad_h), mode='replicate')
         
         flows = []
         num_pairs = len(img1_batch)
@@ -57,9 +60,10 @@ class RAFTFlowEstimator:
             
         flow_tensor = torch.cat(flows, dim=0) # (T-1, 2, H', W')
         
-        # RAFT might have slightly altered the dimensions internally depending on divisibility.
-        # We need to resize the flow back to the exact (H, W) we provided.
-        # IMPORTANT: When resizing flow, we must scale the flow magnitude as well.
+        # Crop away the padding we added
+        if pad_h > 0 or pad_w > 0:
+            flow_tensor = flow_tensor[..., :flow_tensor.shape[-2]-pad_h, :flow_tensor.shape[-1]-pad_w]
+            
         if flow_tensor.shape[-2:] != (H, W):
             curr_h, curr_w = flow_tensor.shape[-2:]
             

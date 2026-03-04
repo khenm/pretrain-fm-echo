@@ -49,7 +49,7 @@ class FlowConsistencyLoss(nn.Module):
         """
         B, T, C, H, W = mask_logits.shape
         if T < 2:
-            return torch.tensor(0.0, device=mask_logits.device)
+            return 0.0 * mask_logits.sum()
 
         # Convert logits to probabilities
         soft_masks = torch.sigmoid(mask_logits)
@@ -68,15 +68,13 @@ class FlowConsistencyLoss(nn.Module):
             loss = F.mse_loss(warped_mask_t, mask_t_plus_1, reduction='none')
         else:
             raise ValueError(f"Unknown loss type {self.loss_type}")
-            
-        # Mask out padded frames if a frame mask is provided
+
         if frame_mask is not None:
-            # We care about transitions where BOTH t and t+1 are valid
             valid_transitions = (frame_mask[:, :-1] > 0.5) & (frame_mask[:, 1:] > 0.5)
             valid_flat = valid_transitions.reshape(-1, 1, 1, 1)
             loss = loss * valid_flat
             if valid_flat.sum() > 0:
                 return loss.sum() / valid_flat.sum()
-            return torch.tensor(0.0, device=loss.device)
+            return 0.0 * mask_logits.sum()
             
         return loss.mean()

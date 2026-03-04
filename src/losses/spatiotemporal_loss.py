@@ -36,9 +36,9 @@ class SpatiotemporalLoss(nn.Module):
         mask_logits = outputs['mask_logits']
 
         target_masks = targets['label']
-        frame_mask = targets['frame_mask']
+        label_mask = targets['frame_mask']
 
-        loss_dice = self._compute_dice_loss(mask_logits, target_masks, frame_mask)
+        loss_dice = self._compute_dice_loss(mask_logits, target_masks, label_mask)
 
         total_loss = self.dice_weight * loss_dice
 
@@ -47,8 +47,8 @@ class SpatiotemporalLoss(nn.Module):
             "dice_loss": loss_dice.detach(),
         }
 
-        if flow in targets and self.flow_weight > 0:
-            loss_flow = self.flow_func(mask_logits, targets['flow'], frame_mask)
+        if 'flow' in targets and self.flow_weight > 0:
+            loss_flow = self.flow_func(mask_logits, targets['flow'], label_mask)
             total_loss += self.flow_weight * loss_flow
             loss_dict['flow_loss'] = loss_flow.detach()
             loss_dict['loss'] = total_loss

@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 from src.utils.dist import is_main_process, get_world_size, get_rank

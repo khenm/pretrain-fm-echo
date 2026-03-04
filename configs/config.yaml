@@ -9,7 +9,7 @@ data:
 training:
   epochs: 100
   lr: 1.2e-4
-  batch_size: 8
+  batch_size: 16
   train_batch_size: 64
   val_batch_size: 64
   num_workers: 12
@@ -28,5 +28,6 @@ loss:
   types: ["SpatiotemporalLoss"]
   kwargs:
     dice_weight: 1.0
+    flow_weight: 0.5
 wandb:
   enable: true
