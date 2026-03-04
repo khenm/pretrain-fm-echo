@@ -56,80 +56,6 @@ class SpatiotemporalDecoder(nn.Module):
         """
         return self.decoder(features)
 
-class DirectVolumeRegressor(nn.Module):
-    """
-    A minimal, high-capacity 1D sequence engine to regress 
-    continuous volume directly from spatiotemporal features.
-    """
-    def __init__(self, in_channels=256, hidden_dim=512):
-        super().__init__()
-        
-        # Squeeze channel projection (in_channels * 2 because of Avg + Max pool concat)
-        self.channel_proj = nn.Conv1d(in_channels * 2, hidden_dim, kernel_size=1)
-        
-        # 1D ConvNeXt-style Temporal Block
-        self.temporal_engine = nn.Sequential(
-            # Depthwise large-kernel convolution over time
-            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=7, padding=3, groups=hidden_dim),
-            nn.GroupNorm(1, hidden_dim), 
-            
-            # Pointwise inverted bottleneck
-            nn.Conv1d(hidden_dim, hidden_dim * 4, kernel_size=1),
-            nn.GELU(),
-            nn.Conv1d(hidden_dim * 4, hidden_dim, kernel_size=1)
-        )
-        
-        # Final projection to a single scalar volume per frame
-        self.regressor = nn.Conv1d(hidden_dim, 1, kernel_size=1)
-
-        # Polynomial Baseline Parameters
-        self.w1 = nn.Parameter(torch.tensor([1.5]))  # Initial linear scale
-        self.w2 = nn.Parameter(torch.tensor([2.0]))   # Initial quadratic scale
-        self.beta = nn.Parameter(torch.tensor([0.0]))  # Global offset
-
-    def forward(self, fused_features, mask_logits):
-        """
-        Args:
-            fused_features (Tensor): (B, C, T, H, W)
-            mask_logits (Tensor): (B, 1, T, H_out, W_out)
-            
-        Returns:
-            Tensor: Continuous volume curve (B, T)
-        """
-        mask_prob = torch.sigmoid(mask_logits)
-        _, _, time_f, h_f, w_f = fused_features.shape
-
-        if mask_prob.shape[2:] != (time_f, h_f, w_f):
-            mask_prob_s = F.adaptive_avg_pool3d(mask_prob, output_size=(time_f, h_f, w_f))
-        else:
-            mask_prob_s = mask_prob
-
-        area_t = mask_prob_s.mean(dim=(3, 4)).squeeze(1) # Shape: (B, T)
-        
-        # Taylor Approximation: v_base = w1 * a + w2 * a^2 + beta
-        v_base = (self.w1 * area_t) + (self.w2 * (area_t ** 2)) + self.beta
-
-        # Multiply to ensure gradients flow EF -> Volume -> Segmentation Masks
-        masked_features = fused_features * mask_prob_s
-        
-        # 1. Dual-Pooling Spatial Squeeze
-        avg_pool = masked_features.mean(dim=(3, 4)) # (B, C, T)
-        max_pool = masked_features.amax(dim=(3, 4)) # (B, C, T)
-        
-        # 2. Sequence Projection
-        x_seq = torch.cat([avg_pool, max_pool], dim=1) # (B, 2C, T)
-        x_seq = self.channel_proj(x_seq)               # (B, hidden_dim, T)
-        
-        # 3. High-Capacity Temporal Modeling (with residual connection)
-        x_seq = x_seq + self.temporal_engine(x_seq)
-        
-        # 4. Direct Frame-by-Frame Regression
-        residual_t = self.regressor(x_seq).squeeze(1)   # (B, T)
-        
-        vol_curve = v_base + residual_t
-        
-        return vol_curve, residual_t
-
 class FiLMFromGlobal(nn.Module):
     """
     Uses global context (B,Cg,T) to modulate spatial tensor (B,Cs,T,H,W).
@@ -202,7 +128,6 @@ class SpatiotemporalEchoModel(nn.Module):
         self.film = FiLMFromGlobal(global_channels=self.shared_channels, spatial_channels=self.shared_channels)
         
         self.decoder = SpatiotemporalDecoder(in_channels=self.shared_channels, out_channels=num_classes)
-        self.volume_head = DirectVolumeRegressor(in_channels=self.shared_channels, hidden_dim=512)
 
     def _extract_fm_features(self, video):
         fm_features = {}
@@ -247,19 +172,9 @@ class SpatiotemporalEchoModel(nn.Module):
 
         # Task Heads
         mask_logits = self.decoder(fused_features)
-        vol_curve, vol_residual = self.volume_head(fused_features, mask_logits)
-
-        pred_edv = vol_curve.max(dim=1)[0]
-        pred_esv = vol_curve.min(dim=1)[0]
-        pred_ef = (pred_edv - pred_esv) / pred_edv.detach().clamp(min=1e-3)
 
         return {
             "mask_logits": mask_logits,
-            "vol_curve": vol_curve,
-            "vol_residual": vol_residual,
-            "pred_edv": pred_edv,
-            "pred_esv": pred_esv,
-            "pred_ef": pred_ef,
             "router_weights": None
         }
 

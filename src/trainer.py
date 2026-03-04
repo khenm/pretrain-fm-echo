@@ -16,75 +16,6 @@ except ImportError:
 
 logger = get_logger()
 
-class LossWeightScheduler:
-    """
-    Dynamically scales loss component weights during training to prevent 
-    unstable gradients from complex compound metrics (like ratios) early on.
-    """
-    def __init__(self, criterions_dict, target_attr='ef_weight', start_epoch=10, end_epoch=20, max_weight=1.0):
-        self.criterions_dict = criterions_dict
-        self.target_attr = target_attr
-        self.start_epoch = start_epoch
-        self.end_epoch = end_epoch
-        self.max_weight = max_weight
-        self.current_weight = 0.0
-
-    def step(self, epoch):
-        # Calculate the linear warmup interpolation
-        if epoch < self.start_epoch:
-            new_weight = 0.0
-        elif epoch >= self.end_epoch:
-            new_weight = self.max_weight
-        else:
-            progress = (epoch - self.start_epoch) / (self.end_epoch - self.start_epoch)
-            new_weight = self.max_weight * progress
-
-        # Apply the weight if it has changed
-        if new_weight != self.current_weight:
-            self.current_weight = new_weight
-            for name, criterion in self.criterions_dict.items():
-                if hasattr(criterion, self.target_attr):
-                    # Handle both standard floats and registered buffer tensors
-                    if isinstance(getattr(criterion, self.target_attr), torch.Tensor):
-                        getattr(criterion, self.target_attr).fill_(self.current_weight)
-                    else:
-                        setattr(criterion, self.target_attr, self.current_weight)
-                    
-                    logger.info(f"\u2696\ufe0f Loss Topology Update: Set '{name}' {self.target_attr} to {self.current_weight:.4f}")
-
-class ResidualDecayScheduler:
-    """
-    Decays the residual magnitude penalty to slowly unleash the 
-    1D temporal engine.
-    """
-    def __init__(self, criterions_dict, start_epoch=10, end_epoch=30, max_weight=1.0, min_weight=0.01):
-        self.criterions_dict = criterions_dict
-        self.start_epoch = start_epoch
-        self.end_epoch = end_epoch
-        self.max_weight = max_weight
-        self.min_weight = min_weight
-        self.current_weight = max_weight
-
-    def step(self, epoch):
-        if epoch <= self.start_epoch:
-            new_weight = self.max_weight
-        elif epoch >= self.end_epoch:
-            new_weight = self.min_weight
-        else:
-            progress = (epoch - self.start_epoch) / (self.end_epoch - self.start_epoch)
-            new_weight = self.max_weight - progress * (self.max_weight - self.min_weight)
-
-        if new_weight != self.current_weight:
-            self.current_weight = new_weight
-            for name, criterion in self.criterions_dict.items():
-                if hasattr(criterion, 'res_mag_weight'):
-                    if isinstance(getattr(criterion, 'res_mag_weight'), torch.Tensor):
-                        getattr(criterion, 'res_mag_weight').fill_(self.current_weight)
-                    else:
-                        setattr(criterion, 'res_mag_weight', self.current_weight)
-                    
-                    logger.info(f"⚖️ Residual Decay Update: Set '{name}' res_mag_weight to {self.current_weight:.4f}")
-
 class Trainer:
     """
     Handles generic training and validation across unified architectures.
@@ -103,45 +34,6 @@ class Trainer:
             self.ld_tr, self.ld_va, self.ld_ts = loaders
 
         self.criterions = criterions or {'ce': torch.nn.CrossEntropyLoss()}
-        scheduler_cfg = self.cfg.get('training', {}).get('ef_warmup', {})
-        self.loss_scheduler = LossWeightScheduler(
-            criterions_dict=self.criterions,
-            target_attr='ef_weight',
-            start_epoch=scheduler_cfg.get('start_epoch', 20),
-            end_epoch=scheduler_cfg.get('end_epoch', 30),
-            max_weight=self.cfg.get('loss', {}).get('kwargs', {}).get('ef_weight_target', 1.0)
-        )
-        
-        res_decay_cfg = self.cfg.get('training', {}).get('res_decay', {})
-        self.res_scheduler = ResidualDecayScheduler(
-            criterions_dict=self.criterions,
-            start_epoch=res_decay_cfg.get('start_epoch', 20),
-            end_epoch=res_decay_cfg.get('end_epoch', 40),
-            max_weight=self.cfg.get('loss', {}).get('kwargs', {}).get('res_mag_weight', 1.0),
-            min_weight=self.cfg.get('loss', {}).get('kwargs', {}).get('res_mag_weight_min', 0.01)
-        )
-
-        dice_only_epochs = self.cfg.get('training', {}).get('dice_only_epochs', 10)
-        class DiceOnlyScheduler:
-            def __init__(self, criterions_dict, end_epoch=10):
-                self.criterions_dict = criterions_dict
-                self.end_epoch = end_epoch
-                self.logged_enable = False
-                self.logged_disable = False
-
-            def step(self, epoch):
-                is_dice_only = epoch <= self.end_epoch
-                for name, criterion in self.criterions_dict.items():
-                    criterion.dice_only_mode = is_dice_only
-                
-                if is_dice_only and not self.logged_enable:
-                    logger.info(f"🛑 Dice Only Mode: All losses except Dice are disabled until epoch {self.end_epoch}.")
-                    self.logged_enable = True
-                elif not is_dice_only and not self.logged_disable and self.logged_enable:
-                    logger.info(f"✅ Dice Only Mode Finished: All losses are now active.")
-                    self.logged_disable = True
-
-        self.dice_only_scheduler = DiceOnlyScheduler(self.criterions, end_epoch=dice_only_epochs)
         
         self.val_metrics = metrics or {}
         import copy
@@ -222,11 +114,6 @@ class Trainer:
         logger.info(f"Starting training from epoch {start_ep}")
 
         for ep in range(start_ep, epochs + 1):
-            if hasattr(self, 'dice_only_scheduler'):
-                self.dice_only_scheduler.step(ep)
-            self.loss_scheduler.step(ep)
-            self.res_scheduler.step(ep)
-            
             if hasattr(self.ld_tr, 'sampler') and hasattr(self.ld_tr.sampler, 'set_epoch'):
                 self.ld_tr.sampler.set_epoch(ep)
 
@@ -388,17 +275,14 @@ class Trainer:
         outputs = {k: v.detach() if isinstance(v, torch.Tensor) else v for k, v in outputs.items()}
 
         mask_logits = outputs.get('mask_logits')
-        vol_curve = outputs.get('vol_curve')
         
-        if mask_logits is None or vol_curve is None:
+        if mask_logits is None:
             return
 
         target_edv = targets.get('target_edv')
         target_esv = targets.get('target_esv')
         target_ef = targets.get('target_ef')
         frame_mask = targets.get('frame_mask')
-
-        B, T = vol_curve.shape
 
         # --- EF metrics ---
         if target_ef is not None and 'mae' in metrics_dict:

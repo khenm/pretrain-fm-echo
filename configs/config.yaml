@@ -23,27 +23,10 @@ training:
   resume_path: null
   pretrain: true
   dice_only_epochs: 10
-  ef_warmup:
-    start_epoch: 20
-    end_epoch: 30
-  res_decay:
-    start_epoch: 30
-    end_epoch: 40
 
 loss:
   types: ["SpatiotemporalLoss"]
   kwargs:
     dice_weight: 1.0
-    volume_weight: 1.0
-    edv_weight: 1.0
-    esv_weight: 1.0
-    ef_weight: 0.0
-    ef_weight_target: 1.0
-    res_mag_weight: 1.0
-    res_mag_weight_min: 0.01
-    res_smooth_weight: 1.0
-    area_smooth_weight: 0.1
-    prob_smooth_weight: 0.1
-
 wandb:
   enable: true

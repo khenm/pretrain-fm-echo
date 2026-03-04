@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from monai.losses import DiceCELoss
+from src.losses.flow import FlowConsistencyLoss
 
 from src.registry import register_loss
 
@@ -14,13 +15,7 @@ class SpatiotemporalLoss(nn.Module):
     def __init__(
         self,
         dice_weight: float = 1.0,
-        volume_weight: float = 1.0,
-        edv_weight: float = 1.0,
-        esv_weight: float = 1.0,
-        ef_weight: float = 100.0,
-        ef_weight_target: float = 1.0,
-        area_smooth_weight: float = 0.1,
-        prob_smooth_weight: float = 0.1,
+        flow_weight: float = 0.5,
         **kwargs,
     ):
         super().__init__()
@@ -28,109 +23,35 @@ class SpatiotemporalLoss(nn.Module):
             import logging
             logging.getLogger().warning(f"SpatiotemporalLoss ignoring unexpected kwargs: {list(kwargs.keys())}")
         self.dice_weight = dice_weight
-        self.volume_weight = volume_weight
-        
-        self.edv_weight = edv_weight
-        self.esv_weight = esv_weight
-        self.ef_weight = ef_weight
-        self.area_smooth_weight = area_smooth_weight
-        self.prob_smooth_weight = prob_smooth_weight
-
-        self.res_mag_weight = kwargs.get('res_mag_weight', 0.1)
-        self.res_smooth_weight = kwargs.get('res_smooth_weight', 1.0)
-
+        self.flow_weight = flow_weight
         self.dice_func = DiceCELoss(sigmoid=True, reduction='mean')
-        self.l1_loss = nn.L1Loss(reduction='none')
+        self.flow_func = FlowConsistencyLoss(loss_type='l2')
 
     def forward(self, outputs, targets):
         """
         Args:
-            outputs (dict): Contains 'mask_logits', 'vol_curve', 'pred_edv', 'pred_esv', 'pred_ef'
-            targets (dict): Raw dataloader batch containing 'label', 'target_edv', 'target_esv', 'target_ef', 'frame_mask'
+            outputs (dict): Contains 'mask_logits'
+            targets (dict): Raw dataloader batch containing 'label', 'frame_mask'
         """
         mask_logits = outputs['mask_logits']
 
         target_masks = targets['label']
-        target_edv = targets['target_edv']
-        target_esv = targets['target_esv']
-        target_ef = targets.get('target_ef')
         frame_mask = targets['frame_mask']
 
         loss_dice = self._compute_dice_loss(mask_logits, target_masks, frame_mask)
 
-        pred_edv = outputs.get('pred_edv', torch.zeros_like(target_edv))
-        pred_esv = outputs.get('pred_esv', torch.zeros_like(target_esv))
-        pred_ef = outputs.get('pred_ef', torch.zeros_like(pred_edv))
-
-        valid_edv_esv = (target_edv >= 0) & (target_esv >= 0)
-        
-        loss_edv = torch.tensor(0.0, device=pred_edv.device)
-        loss_esv = torch.tensor(0.0, device=pred_esv.device)
-        loss_ef = torch.tensor(0.0, device=pred_edv.device)
-
-        if valid_edv_esv.any():
-            loss_edv = self.l1_loss(pred_edv[valid_edv_esv], target_edv[valid_edv_esv]).mean()
-            loss_esv = self.l1_loss(pred_esv[valid_edv_esv], target_esv[valid_edv_esv]).mean()
-            
-        if target_ef is not None:
-            valid_ef = (target_ef >= 0)
-            if valid_ef.any():
-                loss_ef = self.l1_loss(pred_ef[valid_ef], target_ef[valid_ef]).mean()
-
-        loss_vol = (self.edv_weight * loss_edv) + (self.esv_weight * loss_esv) + (self.ef_weight * loss_ef)
-        
-        # Phase 1 and 2: Temporal Mask Regularization
-        # Standardize mask_logits to [B, T, C, H, W] for temporal calculations
-        mask_logits_std = mask_logits
-        if mask_logits.shape[1] == 1 and len(mask_logits.shape) == 5 and mask_logits.shape[2] > 1:
-            mask_logits_std = mask_logits.permute(0, 2, 1, 3, 4)
-            
-        mask_probs = torch.sigmoid(mask_logits_std)
-        area_t = mask_probs.sum(dim=(-1, -2)) # Shape: [B, T, C]
-        
-        loss_area_smooth = torch.tensor(0.0, device=mask_logits.device)
-        if area_t.shape[1] >= 3:
-            diff1 = area_t[:, 1:, :] - area_t[:, :-1, :]
-            diff2 = diff1[:, 1:, :] - diff1[:, :-1, :]
-            loss_area_smooth = diff2.abs().mean()
-            
-        loss_prob_smooth = torch.tensor(0.0, device=mask_logits.device)
-        if mask_probs.shape[1] >= 2:
-            loss_prob_smooth = F.mse_loss(mask_probs[:, 1:], mask_probs[:, :-1])
-        
-        vol_residual = outputs.get('vol_residual')
-        loss_res_mag = torch.tensor(0.0, device=mask_logits.device)
-        loss_res_smooth = torch.tensor(0.0, device=mask_logits.device)
-
-        if vol_residual is not None:
-            # 1. Keep the residual small (prevent it from overriding the mask)
-            loss_res_mag = (vol_residual ** 2).mean()
-            
-            # 2. Keep the residual smooth (Second derivative penalty)
-            if vol_residual.shape[1] >= 3:
-                diff1 = vol_residual[:, 1:] - vol_residual[:, :-1]
-                diff2 = diff1[:, 1:] - diff1[:, :-1]
-                loss_res_smooth = diff2.abs().mean()
-
-        if getattr(self, 'dice_only_mode', False):
-            total_loss = self.dice_weight * loss_dice
-        else:
-            total_loss = (self.dice_weight * loss_dice) + (self.volume_weight * loss_vol) + \
-                         (self.res_mag_weight * loss_res_mag) + (self.res_smooth_weight * loss_res_smooth) + \
-                         (self.area_smooth_weight * loss_area_smooth) + (self.prob_smooth_weight * loss_prob_smooth)
+        total_loss = self.dice_weight * loss_dice
 
         loss_dict = {
             "loss": total_loss,
             "dice_loss": loss_dice.detach(),
-            "volume_loss": loss_vol.detach(),
-            "loss_edv": loss_edv.detach(),
-            "loss_esv": loss_esv.detach(),
-            "loss_ef": loss_ef.detach(),
-            "loss_res_mag": loss_res_mag.detach(),
-            "loss_res_smooth": loss_res_smooth.detach(),
-            "loss_area_smooth": loss_area_smooth.detach(),
-            "loss_prob_smooth": loss_prob_smooth.detach(),
         }
+
+        if flow in targets and self.flow_weight > 0:
+            loss_flow = self.flow_func(mask_logits, targets['flow'], frame_mask)
+            total_loss += self.flow_weight * loss_flow
+            loss_dict['flow_loss'] = loss_flow.detach()
+            loss_dict['loss'] = total_loss
 
         return total_loss, loss_dict
 
@@ -169,11 +90,5 @@ class SpatiotemporalLoss(nn.Module):
     def from_config(cls, cfg):
         loss_cfg = cfg.get("loss", {})
         return cls(
-            dice_weight=loss_cfg.get("dice_weight", 1.0),
-            volume_weight=loss_cfg.get("volume_weight", 1.0),
-            edv_weight=loss_cfg.get("edv_weight", 1.0),
-            esv_weight=loss_cfg.get("esv_weight", 1.0),
-            ef_weight=loss_cfg.get("ef_weight", 100.0),
-            area_smooth_weight=loss_cfg.get("area_smooth_weight", 0.1),
-            prob_smooth_weight=loss_cfg.get("prob_smooth_weight", 0.1)
+            dice_weight=loss_cfg.get("dice_weight", 1.0)
         )

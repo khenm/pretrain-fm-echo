@@ -17,7 +17,7 @@ class EchoNetVideoDataset(Dataset):
     Dataset class for EchoNet-Dynamic Video Classification/Regression.
     Loads video clips for R(2+1)D model.
     """
-    def __init__(self, root_dir, split="TRAIN", max_clip_len=32, img_size=(112, 112), sampling_rate=1, transform=None, pretrain=False):
+    def __init__(self, root_dir, split="TRAIN", max_clip_len=32, img_size=(112, 112), sampling_rate=1, transform=None, pretrain=False, flow_dir=None):
         self.root_dir = root_dir
         self.split = split.upper()
         self.max_clip_len = max_clip_len
@@ -27,6 +27,7 @@ class EchoNetVideoDataset(Dataset):
         self.transform = transform
         self.pretrain = pretrain
         self.max_retries = 5
+        self.flow_dir = flow_dir
         self.max_retries = 5
         self.videos_dir = os.path.join(root_dir, "Videos")
 
@@ -262,6 +263,37 @@ class EchoNetVideoDataset(Dataset):
         if self.transform:
             data = self.transform({"video": video, "label": mask_clip})
             video, mask_clip = data["video"], data.get("label", mask_clip)
+            
+        flow_chunk = None
+        if self.flow_dir and os.path.exists(self.flow_dir):
+            flow_path = os.path.join(self.flow_dir, fname + ".pt")
+            if os.path.exists(flow_path):
+                # Shape: (TotalFrames-1, 2, H, W)
+                full_flow = torch.load(flow_path, weights_only=True).float()
+                
+                # We need flow from start_idx to end_idx - 1
+                f_start = max(0, start_idx) 
+                # Note: full_flow has length total_frames - 1.
+                f_end = min(total_frames - 1, end_idx) 
+                
+                valid_flow = full_flow[f_start:f_end]
+                
+                # Flow length should be T_clip - 1 ideally. Let's pad just like video if necessary
+                target_flow_len = self.max_clip_len - 1
+                curr_flow_len = valid_flow.shape[0]
+                
+                if curr_flow_len < target_flow_len:
+                    pad_left = max(0, f_start - start_idx)
+                    pad_right = target_flow_len - curr_flow_len - pad_left
+                    valid_flow = F.pad(valid_flow, (0,0,0,0, 0,0, pad_left, pad_right), mode='constant', value=0.0)
+                else:
+                    valid_flow = valid_flow[:target_flow_len]
+                    
+                flow_chunk = valid_flow
+            else:
+                flow_chunk = torch.zeros((self.max_clip_len - 1, 2, *self.img_size), dtype=torch.float32)
+        else:
+            flow_chunk = torch.zeros((self.max_clip_len - 1, 2, *self.img_size), dtype=torch.float32)
 
         output = {
             "video": video,
@@ -274,6 +306,9 @@ class EchoNetVideoDataset(Dataset):
             "target_esv": torch.tensor(self.esv_targets[file_idx], dtype=torch.float32)
         }
             
+        if flow_chunk is not None:
+            output["flow"] = flow_chunk
+
         return output
 
 @register_dataset("ECHONET")
@@ -287,14 +322,15 @@ class EchoNet:
 
         max_clip_len = cfg['model'].get('max_clip_len', 16)
         img_size = tuple(cfg['data'].get('img_size', [112, 112]))
+        flow_dir = cfg['data'].get('flow_dir', None)
         
         pretrain = cfg['training'].get('pretrain', False)
         if pretrain:
             logger.info("Pretraining Mode: Filtering clips to contain both ED and ES frames.")
 
-        ds_tr = EchoNetVideoDataset(root_dir, "TRAIN", max_clip_len=max_clip_len, img_size=img_size, pretrain=pretrain)
-        ds_va = EchoNetVideoDataset(root_dir, "VAL", max_clip_len=max_clip_len, img_size=img_size, pretrain=pretrain)
-        ds_ts = EchoNetVideoDataset(root_dir, "TEST", max_clip_len=max_clip_len, img_size=img_size, pretrain=pretrain)
+        ds_tr = EchoNetVideoDataset(root_dir, "TRAIN", max_clip_len=max_clip_len, img_size=img_size, pretrain=pretrain, flow_dir=flow_dir)
+        ds_va = EchoNetVideoDataset(root_dir, "VAL", max_clip_len=max_clip_len, img_size=img_size, pretrain=pretrain, flow_dir=flow_dir)
+        ds_ts = EchoNetVideoDataset(root_dir, "TEST", max_clip_len=max_clip_len, img_size=img_size, pretrain=pretrain, flow_dir=flow_dir)
 
         if cfg['data'].get('subset_size'):
             subset_size = int(cfg['data']['subset_size'])
