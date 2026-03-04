@@ -52,6 +52,39 @@ class LossWeightScheduler:
                     
                     logger.info(f"\u2696\ufe0f Loss Topology Update: Set '{name}' {self.target_attr} to {self.current_weight:.4f}")
 
+class ResidualDecayScheduler:
+    """
+    Decays the residual magnitude penalty to slowly unleash the 
+    1D temporal engine.
+    """
+    def __init__(self, criterions_dict, start_epoch=10, end_epoch=30, max_weight=1.0, min_weight=0.01):
+        self.criterions_dict = criterions_dict
+        self.start_epoch = start_epoch
+        self.end_epoch = end_epoch
+        self.max_weight = max_weight
+        self.min_weight = min_weight
+        self.current_weight = max_weight
+
+    def step(self, epoch):
+        if epoch <= self.start_epoch:
+            new_weight = self.max_weight
+        elif epoch >= self.end_epoch:
+            new_weight = self.min_weight
+        else:
+            progress = (epoch - self.start_epoch) / (self.end_epoch - self.start_epoch)
+            new_weight = self.max_weight - progress * (self.max_weight - self.min_weight)
+
+        if new_weight != self.current_weight:
+            self.current_weight = new_weight
+            for name, criterion in self.criterions_dict.items():
+                if hasattr(criterion, 'res_mag_weight'):
+                    if isinstance(getattr(criterion, 'res_mag_weight'), torch.Tensor):
+                        getattr(criterion, 'res_mag_weight').fill_(self.current_weight)
+                    else:
+                        setattr(criterion, 'res_mag_weight', self.current_weight)
+                    
+                    logger.info(f"⚖️ Residual Decay Update: Set '{name}' res_mag_weight to {self.current_weight:.4f}")
+
 class Trainer:
     """
     Handles generic training and validation across unified architectures.
@@ -74,10 +107,42 @@ class Trainer:
         self.loss_scheduler = LossWeightScheduler(
             criterions_dict=self.criterions,
             target_attr='ef_weight',
-            start_epoch=scheduler_cfg.get('start_epoch', 10),
-            end_epoch=scheduler_cfg.get('end_epoch', 20),
+            start_epoch=scheduler_cfg.get('start_epoch', 20),
+            end_epoch=scheduler_cfg.get('end_epoch', 30),
             max_weight=self.cfg.get('loss', {}).get('kwargs', {}).get('ef_weight_target', 1.0)
         )
+        
+        res_decay_cfg = self.cfg.get('training', {}).get('res_decay', {})
+        self.res_scheduler = ResidualDecayScheduler(
+            criterions_dict=self.criterions,
+            start_epoch=res_decay_cfg.get('start_epoch', 20),
+            end_epoch=res_decay_cfg.get('end_epoch', 40),
+            max_weight=self.cfg.get('loss', {}).get('kwargs', {}).get('res_mag_weight', 1.0),
+            min_weight=self.cfg.get('loss', {}).get('kwargs', {}).get('res_mag_weight_min', 0.01)
+        )
+
+        dice_only_epochs = self.cfg.get('training', {}).get('dice_only_epochs', 10)
+        class DiceOnlyScheduler:
+            def __init__(self, criterions_dict, end_epoch=10):
+                self.criterions_dict = criterions_dict
+                self.end_epoch = end_epoch
+                self.logged_enable = False
+                self.logged_disable = False
+
+            def step(self, epoch):
+                is_dice_only = epoch <= self.end_epoch
+                for name, criterion in self.criterions_dict.items():
+                    criterion.dice_only_mode = is_dice_only
+                
+                if is_dice_only and not self.logged_enable:
+                    logger.info(f"🛑 Dice Only Mode: All losses except Dice are disabled until epoch {self.end_epoch}.")
+                    self.logged_enable = True
+                elif not is_dice_only and not self.logged_disable and self.logged_enable:
+                    logger.info(f"✅ Dice Only Mode Finished: All losses are now active.")
+                    self.logged_disable = True
+
+        self.dice_only_scheduler = DiceOnlyScheduler(self.criterions, end_epoch=dice_only_epochs)
+        
         self.val_metrics = metrics or {}
         import copy
         self.train_metrics = {k: v.clone() if hasattr(v, 'clone') else copy.deepcopy(v) for k, v in self.val_metrics.items()}
@@ -157,7 +222,10 @@ class Trainer:
         logger.info(f"Starting training from epoch {start_ep}")
 
         for ep in range(start_ep, epochs + 1):
+            if hasattr(self, 'dice_only_scheduler'):
+                self.dice_only_scheduler.step(ep)
             self.loss_scheduler.step(ep)
+            self.res_scheduler.step(ep)
             
             if hasattr(self.ld_tr, 'sampler') and hasattr(self.ld_tr.sampler, 'set_epoch'):
                 self.ld_tr.sampler.set_epoch(ep)
@@ -462,7 +530,8 @@ class Trainer:
     def _load_checkpoint(self, path):
         """Delegates loading to the State Manager."""
         if self.state:
-            self.state.load(path, self.model, optimizer=self.opt, scaler=self.scaler)
+            model_to_load = self.model.module if hasattr(self.model, 'module') else self.model
+            self.state.load(path, model_to_load, optimizer=self.opt, scaler=self.scaler)
             return self.state.current_epoch, self.state.best_metric
         return 1, -float('inf')
 

@@ -6,3 +6,20 @@ peft:
   dropout: 0.05
   target_modules: ["qkv", "proj"]
   panecho_target_modules: ["out_proj", "in_proj_weight"]
+
+max_clip_len: 32
+  
+fusion_space:
+  channels: 256
+  time_steps: 16
+  spatial_size: [14, 14]
+
+foundation_models:
+  panecho:
+    enabled: true
+    out_channels: 768
+    out_spatial: [1, 1]
+  echoprime:
+    enabled: true
+    out_channels: 768
+    out_spatial: [7, 7]

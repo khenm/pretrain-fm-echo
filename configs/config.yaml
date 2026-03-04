@@ -1,21 +1,5 @@
 model:
   name: "spatiotemporal"
-  max_clip_len: 32
-  
-  fusion_space:
-    channels: 256
-    time_steps: 16
-    spatial_size: [14, 14]
-
-  foundation_models:
-    panecho:
-      enabled: true
-      out_channels: 768
-      out_spatial: [1, 1]
-    echoprime:
-      enabled: true
-      out_channels: 768
-      out_spatial: [7, 7]
 
 data: 
   name: "echonet"
@@ -23,9 +7,9 @@ data:
   target_key: "batch"
 
 training:
-  epochs: 50
-  lr: 1.0e-4
-  batch_size: 12
+  epochs: 100
+  lr: 1.2e-4
+  batch_size: 8
   train_batch_size: 64
   val_batch_size: 64
   num_workers: 12
@@ -38,6 +22,13 @@ training:
   checkpoint_dir: "/workspace/checkpoints"
   resume_path: null
   pretrain: true
+  dice_only_epochs: 10
+  ef_warmup:
+    start_epoch: 20
+    end_epoch: 30
+  res_decay:
+    start_epoch: 30
+    end_epoch: 40
 
 loss:
   types: ["SpatiotemporalLoss"]
@@ -48,6 +39,11 @@ loss:
     esv_weight: 1.0
     ef_weight: 0.0
     ef_weight_target: 1.0
+    res_mag_weight: 1.0
+    res_mag_weight_min: 0.01
+    res_smooth_weight: 1.0
+    area_smooth_weight: 0.1
+    prob_smooth_weight: 0.1
 
 wandb:
-  enable: false
+  enable: true

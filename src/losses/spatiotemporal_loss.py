@@ -19,6 +19,8 @@ class SpatiotemporalLoss(nn.Module):
         esv_weight: float = 1.0,
         ef_weight: float = 100.0,
         ef_weight_target: float = 1.0,
+        area_smooth_weight: float = 0.1,
+        prob_smooth_weight: float = 0.1,
         **kwargs,
     ):
         super().__init__()
@@ -31,6 +33,11 @@ class SpatiotemporalLoss(nn.Module):
         self.edv_weight = edv_weight
         self.esv_weight = esv_weight
         self.ef_weight = ef_weight
+        self.area_smooth_weight = area_smooth_weight
+        self.prob_smooth_weight = prob_smooth_weight
+
+        self.res_mag_weight = kwargs.get('res_mag_weight', 0.1)
+        self.res_smooth_weight = kwargs.get('res_smooth_weight', 1.0)
 
         self.dice_func = DiceCELoss(sigmoid=True, reduction='mean')
         self.l1_loss = nn.L1Loss(reduction='none')
@@ -71,7 +78,46 @@ class SpatiotemporalLoss(nn.Module):
                 loss_ef = self.l1_loss(pred_ef[valid_ef], target_ef[valid_ef]).mean()
 
         loss_vol = (self.edv_weight * loss_edv) + (self.esv_weight * loss_esv) + (self.ef_weight * loss_ef)
-        total_loss = (self.dice_weight * loss_dice) + (self.volume_weight * loss_vol)
+        
+        # Phase 1 and 2: Temporal Mask Regularization
+        # Standardize mask_logits to [B, T, C, H, W] for temporal calculations
+        mask_logits_std = mask_logits
+        if mask_logits.shape[1] == 1 and len(mask_logits.shape) == 5 and mask_logits.shape[2] > 1:
+            mask_logits_std = mask_logits.permute(0, 2, 1, 3, 4)
+            
+        mask_probs = torch.sigmoid(mask_logits_std)
+        area_t = mask_probs.sum(dim=(-1, -2)) # Shape: [B, T, C]
+        
+        loss_area_smooth = torch.tensor(0.0, device=mask_logits.device)
+        if area_t.shape[1] >= 3:
+            diff1 = area_t[:, 1:, :] - area_t[:, :-1, :]
+            diff2 = diff1[:, 1:, :] - diff1[:, :-1, :]
+            loss_area_smooth = diff2.abs().mean()
+            
+        loss_prob_smooth = torch.tensor(0.0, device=mask_logits.device)
+        if mask_probs.shape[1] >= 2:
+            loss_prob_smooth = F.mse_loss(mask_probs[:, 1:], mask_probs[:, :-1])
+        
+        vol_residual = outputs.get('vol_residual')
+        loss_res_mag = torch.tensor(0.0, device=mask_logits.device)
+        loss_res_smooth = torch.tensor(0.0, device=mask_logits.device)
+
+        if vol_residual is not None:
+            # 1. Keep the residual small (prevent it from overriding the mask)
+            loss_res_mag = (vol_residual ** 2).mean()
+            
+            # 2. Keep the residual smooth (Second derivative penalty)
+            if vol_residual.shape[1] >= 3:
+                diff1 = vol_residual[:, 1:] - vol_residual[:, :-1]
+                diff2 = diff1[:, 1:] - diff1[:, :-1]
+                loss_res_smooth = diff2.abs().mean()
+
+        if getattr(self, 'dice_only_mode', False):
+            total_loss = self.dice_weight * loss_dice
+        else:
+            total_loss = (self.dice_weight * loss_dice) + (self.volume_weight * loss_vol) + \
+                         (self.res_mag_weight * loss_res_mag) + (self.res_smooth_weight * loss_res_smooth) + \
+                         (self.area_smooth_weight * loss_area_smooth) + (self.prob_smooth_weight * loss_prob_smooth)
 
         loss_dict = {
             "loss": total_loss,
@@ -80,6 +126,10 @@ class SpatiotemporalLoss(nn.Module):
             "loss_edv": loss_edv.detach(),
             "loss_esv": loss_esv.detach(),
             "loss_ef": loss_ef.detach(),
+            "loss_res_mag": loss_res_mag.detach(),
+            "loss_res_smooth": loss_res_smooth.detach(),
+            "loss_area_smooth": loss_area_smooth.detach(),
+            "loss_prob_smooth": loss_prob_smooth.detach(),
         }
 
         return total_loss, loss_dict
@@ -123,5 +173,7 @@ class SpatiotemporalLoss(nn.Module):
             volume_weight=loss_cfg.get("volume_weight", 1.0),
             edv_weight=loss_cfg.get("edv_weight", 1.0),
             esv_weight=loss_cfg.get("esv_weight", 1.0),
-            ef_weight=loss_cfg.get("ef_weight", 100.0)
+            ef_weight=loss_cfg.get("ef_weight", 100.0),
+            area_smooth_weight=loss_cfg.get("area_smooth_weight", 0.1),
+            prob_smooth_weight=loss_cfg.get("prob_smooth_weight", 0.1)
         )

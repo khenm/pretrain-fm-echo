@@ -165,7 +165,7 @@ class PanEchoWrapper(nn.Module):
             frames (Tensor): Video frames (batch_size, channels, time, height, width)
 
         Returns:
-            Tensor: Spatiotemporal features (batch_size, feature_dim, time, 1, 1)
+            Tensor: Spatiotemporal features (batch_size, feature_dim, time)
         """
         total_len = frames.shape[2]
         n = self.native_clip_len
@@ -178,12 +178,10 @@ class PanEchoWrapper(nn.Module):
                 end = min(start + n, total_len)
                 chunk = frames[:, :, start:end, :, :]
 
-                # Pad the last chunk if it's shorter than native_clip_len
                 if chunk.shape[2] < n:
                     pad_len = n - chunk.shape[2]
                     chunk = torch.nn.functional.pad(chunk, (0, 0, 0, 0, 0, pad_len), mode='replicate')
                     encoded = self._encode_chunk(chunk)
-                    # Trim the padded frames from the output
                     encoded = encoded[:, :, :end - start]
                 else:
                     encoded = self._encode_chunk(chunk)
@@ -192,7 +190,7 @@ class PanEchoWrapper(nn.Module):
 
             features = torch.cat(chunk_features, dim=2)
 
-        return features.unsqueeze(-1).unsqueeze(-1)
+        return features
 
     @classmethod
     def from_config(cls, cfg):
