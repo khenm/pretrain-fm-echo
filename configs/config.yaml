@@ -28,6 +28,7 @@ loss:
   kwargs:
     dice_weight: 1.0
     flow_weight: 0.5
-    smooth_weight: 1.0
+    curvature_weight: 1.0
+    volume_weight: 0.5
 wandb:
   enable: true

@@ -170,7 +170,6 @@ def render_live_plot(frames: list[np.ndarray], masks: np.ndarray, vol_curve: np.
         
         ax.axvline(x=ed_frame, color='green', linestyle='--', label=f'ED (Frame {ed_frame})')
         ax.axvline(x=es_frame, color='purple', linestyle='--', label=f'ES (Frame {es_frame})')
-        ax.legend(loc='upper right', fontsize='small')
         
         ax.set_xlim(0, max(T-1, 1))
         

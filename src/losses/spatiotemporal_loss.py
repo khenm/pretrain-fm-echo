@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from monai.losses import DiceCELoss
 from src.losses.flow import FlowConsistencyLoss
-from src.losses.smooth import TemporalSmoothnessLoss
+from src.losses.curvature import CurvatureLoss
 
 from src.registry import register_loss
 
@@ -17,7 +17,8 @@ class SpatiotemporalLoss(nn.Module):
         self,
         dice_weight: float = 1.0,
         flow_weight: float = 0.5,
-        smooth_weight: float = 1.0,
+        curvature_weight: float = 1.0,
+        volume_weight: float = 1.0,
         **kwargs,
     ):
         super().__init__()
@@ -26,10 +27,11 @@ class SpatiotemporalLoss(nn.Module):
             logging.getLogger().warning(f"SpatiotemporalLoss ignoring unexpected kwargs: {list(kwargs.keys())}")
         self.dice_weight = dice_weight
         self.flow_weight = flow_weight
-        self.smooth_weight = smooth_weight
+        self.curvature_weight = curvature_weight
+        self.volume_weight = volume_weight
         self.dice_func = DiceCELoss(sigmoid=True, reduction='mean')
         self.flow_func = FlowConsistencyLoss(loss_type='l2')
-        self.smooth_func = TemporalSmoothnessLoss()
+        self.curvature_func = CurvatureLoss()
 
     def forward(self, outputs, targets):
         """
@@ -38,9 +40,9 @@ class SpatiotemporalLoss(nn.Module):
             targets (dict): Raw dataloader batch containing 'label', 'frame_mask'
         """
         mask_logits = outputs['mask_logits']
-
         target_masks = targets['label']
         label_mask = targets['frame_mask']
+        volume = outputs['volume']
 
         if mask_logits.shape[-2:] != target_masks.shape[-2:]:
             target_size = target_masks.shape[-2:]
@@ -61,11 +63,41 @@ class SpatiotemporalLoss(nn.Module):
             "dice_loss": loss_dice.detach(),
         }
 
-        if self.smooth_weight > 0:
-            loss_smooth = self.smooth_func(mask_logits)
-            total_loss += self.smooth_weight * loss_smooth
-            loss_dict['smooth_loss'] = loss_smooth.detach()
-            loss_dict['loss'] = total_loss
+        if self.curvature_weight > 0:
+            loss_curvature = self.curvature_func(volume)
+            total_loss += self.curvature_weight * loss_curvature
+            loss_dict['curvature_loss'] = loss_curvature.detach()
+
+        if self.volume_weight > 0:
+            target_edv = targets.get('target_edv')
+            target_esv = targets.get('target_esv')
+            
+            if target_edv is not None or target_esv is not None:
+                loss_vol = 0.0
+                valid_vol_samples = 0
+                
+                for b in range(volume.shape[0]):
+                    b_frame_mask = label_mask[b]
+                    b_vol = volume[b, :, 0] if volume.shape[-1] == 1 else volume[b].view(-1)
+                    
+                    if target_edv is not None:
+                        ed_idx = torch.where(b_frame_mask == 2.0)[0]
+                        if len(ed_idx) > 0 and target_edv[b] >= 0:
+                            loss_vol += F.l1_loss(b_vol[ed_idx].mean(), target_edv[b])
+                            valid_vol_samples += 1
+                            
+                    if target_esv is not None:
+                        es_idx = torch.where(b_frame_mask == 1.0)[0]
+                        if len(es_idx) > 0 and target_esv[b] >= 0:
+                            loss_vol += F.l1_loss(b_vol[es_idx].mean(), target_esv[b])
+                            valid_vol_samples += 1
+                            
+                if valid_vol_samples > 0:
+                    loss_vol = loss_vol / valid_vol_samples
+                    total_loss += self.volume_weight * loss_vol
+                    loss_dict['volume_loss'] = loss_vol.detach()
+
+        loss_dict['loss'] = total_loss
 
         if 'flow' in targets and self.flow_weight > 0:
             flow_target = targets['flow']
@@ -113,5 +145,6 @@ class SpatiotemporalLoss(nn.Module):
         return cls(
             dice_weight=loss_cfg.get("dice_weight", 1.0),
             flow_weight=loss_cfg.get("flow_weight", 0.5),
-            smooth_weight=loss_cfg.get("smooth_weight", 1.0)
+            curvature_weight=loss_cfg.get("curvature_weight", 1.0),
+            volume_weight=loss_cfg.get("volume_weight", 1.0)
         )

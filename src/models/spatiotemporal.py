@@ -128,6 +128,13 @@ class SpatiotemporalEchoModel(nn.Module):
         self.film = FiLMFromGlobal(global_channels=self.shared_channels, spatial_channels=self.shared_channels)
         
         self.decoder = SpatiotemporalDecoder(in_channels=self.shared_channels, out_channels=num_classes)
+        
+        self.gamma_head = nn.Sequential(
+            nn.Linear(self.shared_channels, 32),
+            nn.ReLU(),
+            nn.Linear(32, 2),
+            nn.Softplus() # Ensures gamma is always strictly positive
+        )
 
     def _extract_fm_features(self, video):
         fm_features = {}
@@ -172,9 +179,34 @@ class SpatiotemporalEchoModel(nn.Module):
 
         # Task Heads
         mask_logits = self.decoder(fused_features)
+        
+        # Scalar Heads
+        pooled_features = fused_features.mean(dim=(2, 3, 4))
+        scalar_preds = self.gamma_head(pooled_features)
+        c = scalar_preds[:, 0]
+        gamma = scalar_preds[:, 1]
+
+        probs = torch.sigmoid(mask_logits)
+
+        A = probs.mean(dim=(-2, -1))
+        A = A.permute(0, 2, 1)
+        
+        if gamma.dim() == 1:
+            gamma = gamma.view(-1, 1, 1)
+        elif gamma.dim() == 2:
+            gamma = gamma.unsqueeze(-1)
+            
+        if c.dim() == 1:
+            c = c.view(-1, 1, 1)
+        elif c.dim() == 2:
+            c = c.unsqueeze(-1)
+            
+        A = torch.clamp(A, min=1e-6)
+        V = c * (A ** gamma)
 
         return {
             "mask_logits": mask_logits,
+            "volume": V,
             "router_weights": None
         }
 
