@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from monai.losses import DiceCELoss
 from src.losses.flow import FlowConsistencyLoss
+from src.losses.smooth import TemporalSmoothnessLoss
 
 from src.registry import register_loss
 
@@ -16,6 +17,7 @@ class SpatiotemporalLoss(nn.Module):
         self,
         dice_weight: float = 1.0,
         flow_weight: float = 0.5,
+        smooth_weight: float = 1.0,
         **kwargs,
     ):
         super().__init__()
@@ -24,8 +26,10 @@ class SpatiotemporalLoss(nn.Module):
             logging.getLogger().warning(f"SpatiotemporalLoss ignoring unexpected kwargs: {list(kwargs.keys())}")
         self.dice_weight = dice_weight
         self.flow_weight = flow_weight
+        self.smooth_weight = smooth_weight
         self.dice_func = DiceCELoss(sigmoid=True, reduction='mean')
         self.flow_func = FlowConsistencyLoss(loss_type='l2')
+        self.smooth_func = TemporalSmoothnessLoss()
 
     def forward(self, outputs, targets):
         """
@@ -56,6 +60,12 @@ class SpatiotemporalLoss(nn.Module):
             "loss": total_loss,
             "dice_loss": loss_dice.detach(),
         }
+
+        if self.smooth_weight > 0:
+            loss_smooth = self.smooth_func(mask_logits)
+            total_loss += self.smooth_weight * loss_smooth
+            loss_dict['smooth_loss'] = loss_smooth.detach()
+            loss_dict['loss'] = total_loss
 
         if 'flow' in targets and self.flow_weight > 0:
             flow_target = targets['flow']
@@ -101,5 +111,7 @@ class SpatiotemporalLoss(nn.Module):
     def from_config(cls, cfg):
         loss_cfg = cfg.get("loss", {})
         return cls(
-            dice_weight=loss_cfg.get("dice_weight", 1.0)
+            dice_weight=loss_cfg.get("dice_weight", 1.0),
+            flow_weight=loss_cfg.get("flow_weight", 0.5),
+            smooth_weight=loss_cfg.get("smooth_weight", 1.0)
         )

@@ -131,15 +131,17 @@ def overlay_mask(image: np.ndarray, mask: np.ndarray, color: tuple[int, int, int
         overlay[:, :, c] = np.where(mask > 0, image[:, :, c] * (1 - alpha) + color[c] * alpha, image[:, :, c])
     return overlay.astype(np.uint8)
 
-def render_live_plot(frames: list[np.ndarray], masks: np.ndarray, vol_curve: np.ndarray, output_path: str, fps: float = 30.0, video_size: tuple[int, int] = (224, 224), gt_mask: np.ndarray | None = None) -> None:
+def render_live_plot(frames: list[np.ndarray], masks: np.ndarray, vol_curve: np.ndarray, output_path: str, fps: float = 30.0, video_size: tuple[int, int] = (224, 224), gt_mask: np.ndarray | None = None, ed_frame: int | None = None, es_frame: int | None = None) -> None:
     T = len(frames)
     if T == 0:
         return
         
     H, W = frames[0].shape[:2]
     
-    ed_frame = np.argmax(vol_curve)
-    es_frame = np.argmin(vol_curve)
+    if ed_frame is None or ed_frame < 0 or ed_frame >= T:
+        ed_frame = np.argmax(vol_curve)
+    if es_frame is None or es_frame < 0 or es_frame >= T:
+        es_frame = np.argmin(vol_curve)
     
     plot_h, plot_w = 200, 448 
     out_w = W * 2 

@@ -53,23 +53,45 @@ def _preprocess_video(frames: list[np.ndarray], device: torch.device) -> torch.T
     video_tensor = torch.from_numpy(video_array).permute(3, 0, 1, 2).unsqueeze(0).contiguous()
     return video_tensor.to(device)
 
-def _get_gt_mask(video_path: str, data_dir: str, img_size: tuple[int, int], T: int) -> np.ndarray | None:
+def _get_gt_data(video_path: str, data_dir: str, img_size: tuple[int, int], T: int) -> tuple[np.ndarray | None, int | None, int | None]:
     tracings_path = os.path.join(data_dir, "VolumeTracings.csv")
-    if not os.path.exists(tracings_path):
-        return None
+    filelist_path = os.path.join(data_dir, "FileListwFrames112.csv")
+    
+    gt_mask = None
+    ed_frame = None
+    es_frame = None
 
-    fname = os.path.basename(video_path)
-    if fname.lower().endswith(('.avi', '.mp4')):
+    fname = os.path.basename(video_path).lower()
+    if fname.endswith('.avi') or fname.endswith('.mp4'):
         fname = fname[:-4]
         
+    if os.path.exists(filelist_path):
+        try:
+            df_file = pd.read_csv(filelist_path)
+            df_file["FileNameLower"] = df_file["FileName"].astype(str).str.lower().str.replace('.avi', '', regex=False)
+            file_meta = df_file[df_file["FileNameLower"] == fname]
+            if not file_meta.empty:
+                ed_frame = file_meta["EDFrame"].values[0]
+                es_frame = file_meta["ESFrame"].values[0]
+                if not np.isnan(ed_frame): ed_frame = int(ed_frame)
+                else: ed_frame = None
+                if not np.isnan(es_frame): es_frame = int(es_frame)
+                else: es_frame = None
+        except Exception as e:
+            logger.error(f"Error loading ED/ES frames from FileListwFrames112.csv: {e}")
+            
+    if not os.path.exists(tracings_path):
+        logger.warning(f"VolumeTracings.csv not found at {tracings_path}. Cannot generate GT mask.")
+        return gt_mask, ed_frame, es_frame
+
     try:
         df = pd.read_csv(tracings_path)
-        df["FileName"] = df["FileName"].astype(str).apply(lambda x: x[:-4] if x.lower().endswith('.avi') else x)
-        file_tracings = df[df["FileName"] == fname]
+        df["FileNameLower"] = df["FileName"].astype(str).str.lower().str.replace('.avi', '', regex=False)
+        file_tracings = df[df["FileNameLower"] == fname]
         
         if file_tracings.empty:
             logger.warning(f"No GT tracings found for {fname} in VolumeTracings.csv.")
-            return None
+            return gt_mask, ed_frame, es_frame
 
         logger.info(f"Generating GT mask for {fname}...")
         H, W = img_size
@@ -80,10 +102,10 @@ def _get_gt_mask(video_path: str, data_dir: str, img_size: tuple[int, int], T: i
             if not t_subset.empty:
                 gt_mask[t] = EchoNetVideoDataset._generate_mask(t_subset, H, W)
                 
-        return gt_mask
+        return gt_mask, ed_frame, es_frame
     except Exception as e:
         logger.error(f"Error loading GT mask: {e}")
-        return None
+        return None, ed_frame, es_frame
 
 def _save_results(args, full_masks: np.ndarray, full_vol_curve: np.ndarray) -> None:
     if args.return_masks:
@@ -125,10 +147,10 @@ def run_inference(args) -> tuple[np.ndarray, np.ndarray] | None:
     output_video_path = os.path.join(args.result, "output.mp4")
     
     data_dir = getattr(args, "data_dir", "datasets/echonet-dynamic")
-    gt_mask = _get_gt_mask(args.video, data_dir, img_size, T)
+    gt_mask, ed_frame, es_frame = _get_gt_data(args.video, data_dir, img_size, T)
             
     logger.info(f"Rendering live video plot to {output_video_path}")
-    render_live_plot(frames, full_masks, full_vol_curve, output_video_path, fps=fps, video_size=img_size, gt_mask=gt_mask)
+    render_live_plot(frames, full_masks, full_vol_curve, output_video_path, fps=fps, video_size=img_size, gt_mask=gt_mask, ed_frame=ed_frame, es_frame=es_frame)
     
     _save_results(args, full_masks, full_vol_curve)
     
