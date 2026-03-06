@@ -279,49 +279,70 @@ class Trainer:
         if mask_logits is None:
             return
 
+        volume = outputs.get('volume')
+        
         target_edv = targets.get('target_edv')
         target_esv = targets.get('target_esv')
         target_ef = targets.get('target_ef')
         frame_mask = targets.get('frame_mask')
 
+        # Compute pred_edv and pred_esv per batch from volume and frame_mask
+        pred_edv = None
+        pred_esv = None
+        
+        if volume is not None and frame_mask is not None:
+            B = volume.shape[0]
+            pred_edv = torch.zeros(B, device=volume.device)
+            pred_esv = torch.zeros(B, device=volume.device)
+            has_valid_vol = torch.zeros(B, dtype=torch.bool, device=volume.device)
+            
+            for b in range(B):
+                b_frame_mask = frame_mask[b]
+                b_vol = volume[b, :, 0] if volume.dim() > 2 and volume.shape[-1] == 1 else volume[b].view(-1)
+                
+                ed_idx = torch.where(b_frame_mask == 2.0)[0]
+                es_idx = torch.where(b_frame_mask == 1.0)[0]
+                
+                if len(ed_idx) > 0 and len(es_idx) > 0:
+                    pred_edv[b] = b_vol[ed_idx].mean()
+                    pred_esv[b] = b_vol[es_idx].mean()
+                    has_valid_vol[b] = True
+
         # --- EF metrics ---
-        if target_ef is not None and 'mae' in metrics_dict:
-            pred_edv = outputs.get('pred_edv')
-            pred_esv = outputs.get('pred_esv')
-            if pred_edv is not None and pred_esv is not None:
+        if target_ef is not None and 'mae' in metrics_dict and pred_edv is not None:
+            valid_ef = (target_ef >= 0) & has_valid_vol
+            if valid_ef.any():
                 pred_ef = torch.where(
                     pred_edv > 1e-6,
-                    (pred_edv - pred_esv) / pred_edv,
+                    (pred_edv - pred_esv) / pred_edv.clamp(min=1e-3),
                     torch.zeros_like(pred_edv)
                 )
-                valid_ef = (target_ef >= 0)
-                if valid_ef.any():
-                    metrics_dict['mae'](pred_ef[valid_ef], target_ef[valid_ef])
-                    if 'rmse' in metrics_dict:
-                        metrics_dict['rmse'](pred_ef[valid_ef], target_ef[valid_ef])
-                    if 'r2' in metrics_dict:
-                        metrics_dict['r2'](pred_ef[valid_ef], target_ef[valid_ef])
+                metrics_dict['mae'](pred_ef[valid_ef], target_ef[valid_ef])
+                if 'rmse' in metrics_dict:
+                    metrics_dict['rmse'](pred_ef[valid_ef], target_ef[valid_ef])
+                if 'r2' in metrics_dict:
+                    metrics_dict['r2'](pred_ef[valid_ef], target_ef[valid_ef])
 
         # --- EDV / ESV volume metrics ---
-        if target_edv is not None and 'mae_edv' in metrics_dict:
-            pred_edv = outputs.get('pred_edv')
-            pred_esv = outputs.get('pred_esv')
-            
-            if pred_edv is not None and pred_esv is not None:
-                valid_edv = (target_edv >= 0)
-                if valid_edv.any():
-                    p_edv_ml = pred_edv[valid_edv] * 300.0
-                    t_edv_ml = target_edv[valid_edv] * 300.0
-                    metrics_dict['mae_edv'](p_edv_ml, t_edv_ml)
+        if target_edv is not None and 'mae_edv' in metrics_dict and pred_edv is not None:
+            valid_edv = (target_edv >= 0) & has_valid_vol
+            if valid_edv.any():
+                p_edv_ml = pred_edv[valid_edv] * 300.0
+                t_edv_ml = target_edv[valid_edv] * 300.0
+                metrics_dict['mae_edv'](p_edv_ml, t_edv_ml)
+                if 'rmse_edv' in metrics_dict:
                     metrics_dict['rmse_edv'](p_edv_ml, t_edv_ml)
+                if 'r2_edv' in metrics_dict:
                     metrics_dict['r2_edv'](p_edv_ml, t_edv_ml)
 
-                valid_esv = (target_esv >= 0)
-                if valid_esv.any():
-                    p_esv_ml = pred_esv[valid_esv] * 300.0
-                    t_esv_ml = target_esv[valid_esv] * 300.0
-                    metrics_dict['mae_esv'](p_esv_ml, t_esv_ml)
+            valid_esv = (target_esv >= 0) & has_valid_vol
+            if valid_esv.any():
+                p_esv_ml = pred_esv[valid_esv] * 300.0
+                t_esv_ml = target_esv[valid_esv] * 300.0
+                metrics_dict['mae_esv'](p_esv_ml, t_esv_ml)
+                if 'rmse_esv' in metrics_dict:
                     metrics_dict['rmse_esv'](p_esv_ml, t_esv_ml)
+                if 'r2_esv' in metrics_dict:
                     metrics_dict['r2_esv'](p_esv_ml, t_esv_ml)
 
         # --- Dice metric ---

@@ -19,6 +19,7 @@ class SpatiotemporalLoss(nn.Module):
         flow_weight: float = 0.5,
         curvature_weight: float = 1.0,
         volume_weight: float = 1.0,
+        ef_weight: float = 1.0,
         **kwargs,
     ):
         super().__init__()
@@ -29,6 +30,7 @@ class SpatiotemporalLoss(nn.Module):
         self.flow_weight = flow_weight
         self.curvature_weight = curvature_weight
         self.volume_weight = volume_weight
+        self.ef_weight = ef_weight
         self.dice_func = DiceCELoss(sigmoid=True, reduction='mean')
         self.flow_func = FlowConsistencyLoss(loss_type='l2')
         self.curvature_func = CurvatureLoss()
@@ -68,34 +70,52 @@ class SpatiotemporalLoss(nn.Module):
             total_loss += self.curvature_weight * loss_curvature
             loss_dict['curvature_loss'] = loss_curvature.detach()
 
-        if self.volume_weight > 0:
+        if self.volume_weight > 0 or self.ef_weight > 0:
             target_edv = targets.get('target_edv')
             target_esv = targets.get('target_esv')
+            target_ef = targets.get('target_ef')
             
-            if target_edv is not None or target_esv is not None:
+            if target_edv is not None or target_esv is not None or target_ef is not None:
                 loss_vol = 0.0
                 valid_vol_samples = 0
+                loss_ef = 0.0
+                valid_ef_samples = 0
                 
                 for b in range(volume.shape[0]):
                     b_frame_mask = label_mask[b]
                     b_vol = volume[b, :, 0] if volume.shape[-1] == 1 else volume[b].view(-1)
                     
-                    if target_edv is not None:
-                        ed_idx = torch.where(b_frame_mask == 2.0)[0]
-                        if len(ed_idx) > 0 and target_edv[b] >= 0:
-                            loss_vol += F.l1_loss(b_vol[ed_idx].mean(), target_edv[b])
+                    ed_idx = torch.where(b_frame_mask == 2.0)[0]
+                    es_idx = torch.where(b_frame_mask == 1.0)[0]
+                    
+                    pred_edv = b_vol[ed_idx].mean() if len(ed_idx) > 0 else None
+                    pred_esv = b_vol[es_idx].mean() if len(es_idx) > 0 else None
+                    
+                    if self.volume_weight > 0:
+                        if target_edv is not None and pred_edv is not None and target_edv[b] >= 0:
+                            loss_vol += F.l1_loss(pred_edv, target_edv[b])
                             valid_vol_samples += 1
                             
-                    if target_esv is not None:
-                        es_idx = torch.where(b_frame_mask == 1.0)[0]
-                        if len(es_idx) > 0 and target_esv[b] >= 0:
-                            loss_vol += F.l1_loss(b_vol[es_idx].mean(), target_esv[b])
+                        if target_esv is not None and pred_esv is not None and target_esv[b] >= 0:
+                            loss_vol += F.l1_loss(pred_esv, target_esv[b])
                             valid_vol_samples += 1
                             
-                if valid_vol_samples > 0:
+                    if self.ef_weight > 0 and target_ef is not None and target_ef[b] >= 0:
+                        if pred_edv is not None and pred_esv is not None:
+                            clamped_edv = pred_edv.clamp(min=1e-3)
+                            pred_ef = (clamped_edv - pred_esv) / clamped_edv
+                            loss_ef += F.l1_loss(pred_ef, target_ef[b])
+                            valid_ef_samples += 1
+
+                if self.volume_weight > 0 and valid_vol_samples > 0:
                     loss_vol = loss_vol / valid_vol_samples
                     total_loss += self.volume_weight * loss_vol
                     loss_dict['volume_loss'] = loss_vol.detach()
+
+                if self.ef_weight > 0 and valid_ef_samples > 0:
+                    loss_ef = loss_ef / valid_ef_samples
+                    total_loss += self.ef_weight * loss_ef
+                    loss_dict['ef_loss'] = loss_ef.detach()
 
         loss_dict['loss'] = total_loss
 
@@ -146,5 +166,6 @@ class SpatiotemporalLoss(nn.Module):
             dice_weight=loss_cfg.get("dice_weight", 1.0),
             flow_weight=loss_cfg.get("flow_weight", 0.5),
             curvature_weight=loss_cfg.get("curvature_weight", 1.0),
-            volume_weight=loss_cfg.get("volume_weight", 1.0)
+            volume_weight=loss_cfg.get("volume_weight", 1.0),
+            ef_weight=loss_cfg.get("ef_weight", 1.0)
         )
