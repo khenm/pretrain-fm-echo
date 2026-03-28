@@ -129,12 +129,10 @@ class SpatiotemporalEchoModel(nn.Module):
         
         self.decoder = SpatiotemporalDecoder(in_channels=self.shared_channels, out_channels=num_classes)
         
-        self.gamma_head = nn.Sequential(
-            nn.Linear(self.shared_channels, 32),
-            nn.ReLU(),
-            nn.Linear(32, 2),
-            nn.Softplus() # Ensures gamma is always strictly positive
-        )
+        self.c_head = nn.Linear(self.shared_channels, 1)
+        nn.init.constant_(self.c_head.bias, 1.15)
+        self.gamma = nn.Parameter(torch.tensor(1.5))
+        self.beta = nn.Parameter(torch.tensor(0.5))
 
     def _extract_fm_features(self, video):
         fm_features = {}
@@ -181,32 +179,53 @@ class SpatiotemporalEchoModel(nn.Module):
         mask_logits = self.decoder(fused_features)
         
         # Scalar Heads
-        pooled_features = fused_features.mean(dim=(2, 3, 4))
-        scalar_preds = self.gamma_head(pooled_features)
-        c = scalar_preds[:, 0]
-        gamma = scalar_preds[:, 1]
+        spatial_pooled = fused_features.mean(dim=(3, 4)) # (B, C, T)
+        spatial_pooled = spatial_pooled.permute(0, 2, 1) # (B, T, C)
+        ln_c_t = self.c_head(spatial_pooled)             # (B, T, 1)
 
-        probs = torch.sigmoid(mask_logits)
+        probs = torch.sigmoid(mask_logits)               # (B, 1, T, H, W)
 
-        A = probs.mean(dim=(-2, -1))
-        A = A.permute(0, 2, 1)
+        # Raw Pixel Area
+        A_raw = probs.sum(dim=(-2, -1))                  # (B, 1, T)
+        A_raw = torch.clamp(A_raw, min=1e-3)
+        A_raw = A_raw.permute(0, 2, 1)                   # (B, T, 1)
         
-        if gamma.dim() == 1:
-            gamma = gamma.view(-1, 1, 1)
-        elif gamma.dim() == 2:
-            gamma = gamma.unsqueeze(-1)
-            
-        if c.dim() == 1:
-            c = c.view(-1, 1, 1)
-        elif c.dim() == 2:
-            c = c.unsqueeze(-1)
-            
-        A = torch.clamp(A, min=1e-6)
-        V = c * (A ** gamma)
+        # Differential Long Axis Length (L) using spatial covariance
+        B, C, T, H, W = probs.shape
+        y = torch.arange(H, device=probs.device, dtype=probs.dtype)
+        x = torch.arange(W, device=probs.device, dtype=probs.dtype)
+        grid_y, grid_x = torch.meshgrid(y, x, indexing='ij')
+        
+        grid_x = grid_x.view(1, 1, 1, H, W)
+        grid_y = grid_y.view(1, 1, 1, H, W)
+        
+        A_sum = probs.sum(dim=(-2, -1), keepdim=True) + 1e-6
+        mu_x = (probs * grid_x).sum(dim=(-2, -1), keepdim=True) / A_sum
+        mu_y = (probs * grid_y).sum(dim=(-2, -1), keepdim=True) / A_sum
+        
+        M_xx = (probs * (grid_x - mu_x)**2).sum(dim=(-2, -1)) / A_sum.squeeze(-1).squeeze(-1)
+        M_yy = (probs * (grid_y - mu_y)**2).sum(dim=(-2, -1)) / A_sum.squeeze(-1).squeeze(-1)
+        M_xy = (probs * (grid_x - mu_x) * (grid_y - mu_y)).sum(dim=(-2, -1)) / A_sum.squeeze(-1).squeeze(-1)
+        
+        eps_val = 1e-3
+        trace_half = (M_xx + M_yy) / 2.0
+        gap_half = (M_xx - M_yy) / 2.0
+        lambda_1 = trace_half + torch.sqrt(gap_half**2 + M_xy**2 + eps_val)
+        
+        L_raw = torch.sqrt(lambda_1 + eps_val)           # (B, 1, T)
+        L_raw = L_raw.permute(0, 2, 1)                   # (B, T, 1)
+
+        ln_A = torch.log(A_raw)
+        ln_L = torch.log(L_raw)
+        
+        ln_V = ln_c_t + self.gamma * ln_A + self.beta * ln_L
+        V = torch.exp(ln_V)
 
         return {
             "mask_logits": mask_logits,
-            "volume": V,
+            "volume": V.squeeze(-1),
+            "vol_curve": V.squeeze(-1),
+            "ln_vol_curve": ln_V.squeeze(-1),
             "router_weights": None
         }
 

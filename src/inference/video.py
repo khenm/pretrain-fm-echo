@@ -64,7 +64,7 @@ def _compute_vol_curve(mask_logits: torch.Tensor) -> torch.Tensor:
         
     return torch.tensor(vol_curve_list, device=mask_logits.device, dtype=torch.float32).unsqueeze(0)
 
-def sliding_window_inference(model, video_tensor, clip_len=16, overlap=0, device="cuda"):
+def sliding_window_inference(model, video_tensor, clip_len=16, overlap=0, device="cuda", auditor=None):
     """
     Runs sliding window inference on the full video tensor.
     
@@ -74,10 +74,13 @@ def sliding_window_inference(model, video_tensor, clip_len=16, overlap=0, device
         clip_len: length of each temporal clip.
         overlap: temporal overlap (not yet implemented fully, using non-overlapping or simple chunking).
         device: typical device to run.
+        auditor: Optional SelfAuditor instance for OOD detection via Martingale Wealth.
         
     Returns:
         full_masks: (T, H, W) numpy array of mask probabilities or binary masks.
         full_vol_curve: (T,) numpy array of volume estimates.
+        clip_starts: list of integers.
+        wealth_curve: (T,) numpy array of Martingale Wealth values (or None).
     """
     model.eval()
     
@@ -88,8 +91,10 @@ def sliding_window_inference(model, video_tensor, clip_len=16, overlap=0, device
     full_vol_curve = torch.zeros((T,), device=device)
     counts = torch.zeros((T,), device=device)
     
+    clip_starts = []
     with torch.no_grad():
         for start_idx in range(0, T, stride):
+            clip_starts.append(start_idx)
             end_idx = min(start_idx + clip_len, T)
             
             chunk = video_tensor[:, :, start_idx:end_idx, :, :]
@@ -103,7 +108,12 @@ def sliding_window_inference(model, video_tensor, clip_len=16, overlap=0, device
             outputs = model(chunk)
             
             mask_logits = outputs["mask_logits"]
-            vol_curve = outputs.get("vol_curve", _compute_vol_curve(mask_logits))
+            if "volume" in outputs and outputs["volume"] is not None:
+                vol_curve = outputs["volume"]
+                if vol_curve.dim() == 3:
+                    vol_curve = vol_curve.squeeze(-1)
+            else:
+                vol_curve = _compute_vol_curve(mask_logits)
             
             if mask_logits.shape[2:] != (clip_len, H, W):
                 mask_logits = F.interpolate(mask_logits, size=(clip_len, H, W), mode='trilinear', align_corners=False)
@@ -122,7 +132,16 @@ def sliding_window_inference(model, video_tensor, clip_len=16, overlap=0, device
     full_vol_curve = full_vol_curve / counts
     
     full_masks = (torch.sigmoid(full_mask_logits) > 0.5).cpu().numpy().astype(np.uint8)
-    return full_masks, full_vol_curve.cpu().numpy()
+    
+    wealth_curve = None
+    if auditor is not None:
+        wealth_history = []
+        for t in range(T):
+            wealth = auditor.update(full_mask_logits[t].unsqueeze(0), is_logits=True)
+            wealth_history.append(wealth)
+        wealth_curve = np.array(wealth_history)
+        
+    return full_masks, full_vol_curve.cpu().numpy(), clip_starts, wealth_curve
 
 def overlay_mask(image: np.ndarray, mask: np.ndarray, color: tuple[int, int, int] = (0, 255, 0), alpha: float = 0.4) -> np.ndarray:
     """Overlays a binary mask on an RGB image."""
@@ -131,7 +150,7 @@ def overlay_mask(image: np.ndarray, mask: np.ndarray, color: tuple[int, int, int
         overlay[:, :, c] = np.where(mask > 0, image[:, :, c] * (1 - alpha) + color[c] * alpha, image[:, :, c])
     return overlay.astype(np.uint8)
 
-def render_live_plot(frames: list[np.ndarray], masks: np.ndarray, vol_curve: np.ndarray, output_path: str, fps: float = 30.0, video_size: tuple[int, int] = (224, 224), gt_mask: np.ndarray | None = None, ed_frame: int | None = None, es_frame: int | None = None) -> None:
+def render_live_plot(frames: list[np.ndarray], masks: np.ndarray, vol_curve: np.ndarray, output_path: str, fps: float = 30.0, video_size: tuple[int, int] = (224, 224), gt_mask: np.ndarray | None = None, ed_frame: int | None = None, es_frame: int | None = None, edv: float | None = None, esv: float | None = None, clip_starts: list[int] | None = None, wealth_curve: np.ndarray | None = None) -> None:
     T = len(frames)
     if T == 0:
         return
@@ -168,13 +187,34 @@ def render_live_plot(frames: list[np.ndarray], masks: np.ndarray, vol_curve: np.
         ax.plot(range(t+1), vol_curve[:t+1], color='red', linewidth=2)
         ax.scatter([t], [vol_curve[t]], color='red', s=50, zorder=5)
         
+        if clip_starts:
+            for start in clip_starts:
+                ax.axvline(x=start, color='lightgray', linestyle=':', zorder=1)
+                
+        if wealth_curve is not None:
+            ax2 = ax.twinx()
+            ax2.plot(range(T), wealth_curve, color='#9467bd', label='Wealth', alpha=0.5, linestyle=':')
+            ax2.plot(range(t+1), wealth_curve[:t+1], color='#9467bd', linewidth=2, linestyle=':')
+            ax2.scatter([t], [wealth_curve[t]], color='#9467bd', s=50, zorder=5)
+            ax2.set_ylabel('Wealth (OOD)', color='#9467bd')
+            ax2.tick_params(axis='y', labelcolor='#9467bd')
+            ax2.set_ylim(0, max(max(wealth_curve), 2.0) * 1.2)
+                
         ax.axvline(x=ed_frame, color='green', linestyle='--', label=f'ED (Frame {ed_frame})')
         ax.axvline(x=es_frame, color='purple', linestyle='--', label=f'ES (Frame {es_frame})')
         
+        if ed_frame is not None and edv is not None:
+            ax.scatter([ed_frame], [edv / 300.0], color='green', marker='o', s=80, zorder=6)
+        if es_frame is not None and esv is not None:
+            ax.scatter([es_frame], [esv / 300.0], color='purple', marker='o', s=80, zorder=6)
+        
         ax.set_xlim(0, max(T-1, 1))
         
-        min_vol, max_vol = np.min(vol_curve), np.max(vol_curve)
-        margin = max((max_vol - min_vol) * 0.1, 10)
+        vols_to_plot = list(vol_curve)
+        if ed_frame is not None and edv is not None: vols_to_plot.append(edv / 300.0)
+        if es_frame is not None and esv is not None: vols_to_plot.append(esv / 300.0)
+        min_vol, max_vol = np.min(vols_to_plot), np.max(vols_to_plot)
+        margin = max((max_vol - min_vol) * 0.1, 1e-3)
         ax.set_ylim(min_vol - margin, max_vol + margin)
         
         ax.set_title(f"Volume: {vol_curve[t]:.2f}")

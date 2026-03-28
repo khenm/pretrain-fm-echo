@@ -13,6 +13,8 @@ def parse_args():
     parser.add_argument("--result", type=str, default="results", help="Directory to save the resulting output.mp4. Default is /results")
     parser.add_argument("--data_dir", type=str, default="datasets/echonet-dynamic", help="Path to the dataset directory containing VolumeTracings.csv.")
     parser.add_argument("--return_masks", action="store_true", help="If passed, will save the segmentation masks and volume curve to disk.")
+    parser.add_argument("--audit", action="store_true", help="Enable SelfAuditor to calculate Martingale Wealth.")
+    parser.add_argument("--audit_stats", type=str, default=None, help="Path to audit stats JSON file for calibrated eps and max entropies.")
     
     return parser.parse_args()
 

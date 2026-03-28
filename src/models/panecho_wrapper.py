@@ -64,7 +64,33 @@ def load_panecho_isolated(clip_len=16):
         spec = importlib.util.spec_from_file_location("panecho_hubconf", pt_path)
         hubconf = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(hubconf)
-        model = hubconf.PanEcho(pretrained=True, clip_len=clip_len)
+        
+        import pandas as pd
+        orig_read_pickle = pd.read_pickle
+        orig_load_state_dict_from_url = torch.hub.load_state_dict_from_url
+        
+        def mock_read_pickle(filepath_or_buffer, *args, **kwargs):
+            if isinstance(filepath_or_buffer, str) and 'tasks.pkl' in filepath_or_buffer:
+                return {} 
+            return orig_read_pickle(filepath_or_buffer, *args, **kwargs)
+            
+        def mock_load_state_dict_from_url(url, *args, **kwargs):
+            if 'panecho.pt' in url:
+                weights_path = os.path.join(project_root, 'model_card', 'panecho.pt')
+                if os.path.exists(weights_path):
+                    logger.info(f"Loading local PanEcho weights from {weights_path}")
+                    return torch.load(weights_path, map_location=kwargs.get('map_location', 'cpu'))
+                else:
+                    logger.warning(f"Local weights not found at {weights_path}. Falling back to URL.")
+            return orig_load_state_dict_from_url(url, *args, **kwargs)
+            
+        try:
+            pd.read_pickle = mock_read_pickle
+            torch.hub.load_state_dict_from_url = mock_load_state_dict_from_url
+            model = hubconf.PanEcho(pretrained=True, clip_len=clip_len)
+        finally:
+            pd.read_pickle = orig_read_pickle
+            torch.hub.load_state_dict_from_url = orig_load_state_dict_from_url
 
         if is_distributed and local_rank == 0:
             dist.barrier()

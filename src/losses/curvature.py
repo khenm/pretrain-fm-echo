@@ -33,6 +33,6 @@ class CurvatureLoss(nn.Module):
         denominator = (1 + v_t ** 2) ** 1.5
         
         k_t = numerator / denominator
-        loss = k_t ** 2
+        loss = torch.abs(k_t)
         
         return loss.mean()

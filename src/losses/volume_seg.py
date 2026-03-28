@@ -20,18 +20,23 @@ class JointVolumeSegLoss(nn.Module):
 
     def forward(self, outputs, target_mask, target_vol):
         """
-        outputs: dictionary containing "mask_logits" (B, 1, T, H, W) and "vol_curve" (B, T)
+        outputs: dictionary containing "mask_logits" (B, 1, T, H, W) and "ln_vol_curve" (B, T)
         target_mask: true binary masks, shape (B, 1, T, H, W)
-        target_vol: ground truth volume curves, shape (B, T)
+        target_vol: ground truth volume curves, shape (B, T). Missing/invalid frames should be 0 or NaN.
         """
         mask_logits = outputs["mask_logits"]
-        pred_vol = outputs["vol_curve"]
+        pred_ln_vol = outputs["ln_vol_curve"]
         
         # 1) Spatiotemporal Mask Loss
         loss_seg = self.bce(mask_logits, target_mask.float())
         
-        # 2) Geometric Volume Loss (MSE over the temporal sequence)
-        loss_vol = self.mse(pred_vol, target_vol.float())
+        # 2) Geometric Volume Loss (MSE on log-volume at ED/ES frames)
+        valid_mask = (target_vol > 0) & ~torch.isnan(target_vol)
+        if valid_mask.sum() > 0:
+            target_ln_vol = torch.log(torch.clamp(target_vol[valid_mask], min=1e-3))
+            loss_vol = self.mse(pred_ln_vol[valid_mask], target_ln_vol.float())
+        else:
+            loss_vol = torch.tensor(0.0, device=pred_ln_vol.device)
         
         # Joint Optimization
         total_loss = (self.seg_weight * loss_seg) + (self.vol_weight * loss_vol)
