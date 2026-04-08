@@ -64,7 +64,7 @@ def _compute_vol_curve(mask_logits: torch.Tensor) -> torch.Tensor:
         
     return torch.tensor(vol_curve_list, device=mask_logits.device, dtype=torch.float32).unsqueeze(0)
 
-def sliding_window_inference(model, video_tensor, clip_len=16, overlap=0, device="cuda", auditor=None):
+def sliding_window_inference(model, video_tensor, clip_len=16, overlap=0, batch_size=1, device="cuda", auditor=None):
     """
     Runs sliding window inference on the full video tensor.
     
@@ -73,6 +73,7 @@ def sliding_window_inference(model, video_tensor, clip_len=16, overlap=0, device
         video_tensor: (1, 3, T, H, W) tensor on device.
         clip_len: length of each temporal clip.
         overlap: temporal overlap (not yet implemented fully, using non-overlapping or simple chunking).
+        batch_size: number of clips to process in a single forward pass.
         device: typical device to run.
         auditor: Optional SelfAuditor instance for OOD detection via Martingale Wealth.
         
@@ -92,7 +93,11 @@ def sliding_window_inference(model, video_tensor, clip_len=16, overlap=0, device
     counts = torch.zeros((T,), device=device)
     
     clip_starts = []
+    
     with torch.no_grad():
+        pending_chunks = []
+        pending_indices = []
+        
         for start_idx in range(0, T, stride):
             clip_starts.append(start_idx)
             end_idx = min(start_idx + clip_len, T)
@@ -104,29 +109,48 @@ def sliding_window_inference(model, video_tensor, clip_len=16, overlap=0, device
                 pad_len = clip_len - actual_len
                 pad_tensor = chunk[:, :, -1:].expand(-1, -1, pad_len, -1, -1)
                 chunk = torch.cat([chunk, pad_tensor], dim=2)
+            
+            pending_chunks.append(chunk)
+            pending_indices.append((start_idx, end_idx, actual_len))
+            
+            if len(pending_chunks) >= batch_size or (start_idx + stride >= T):
+                if not pending_chunks:
+                    continue
+                    
+                batch_input = torch.cat(pending_chunks, dim=0) # (B, 3, clip_len, H, W)
+                outputs = model(batch_input)
                 
-            outputs = model(chunk)
-            
-            mask_logits = outputs["mask_logits"]
-            if "volume" in outputs and outputs["volume"] is not None:
-                vol_curve = outputs["volume"]
-                if vol_curve.dim() == 3:
-                    vol_curve = vol_curve.squeeze(-1)
-            else:
-                vol_curve = _compute_vol_curve(mask_logits)
-            
-            if mask_logits.shape[2:] != (clip_len, H, W):
-                mask_logits = F.interpolate(mask_logits, size=(clip_len, H, W), mode='trilinear', align_corners=False)
-            mask_logits = mask_logits.squeeze(0).squeeze(0)
-            
-            vol_curve = vol_curve.unsqueeze(0)
-            if vol_curve.shape[2] != clip_len:
-                vol_curve = F.interpolate(vol_curve, size=clip_len, mode='linear', align_corners=False)
-            vol_curve = vol_curve.squeeze(0).squeeze(0)
-            
-            full_mask_logits[start_idx:end_idx] += mask_logits[:actual_len]
-            full_vol_curve[start_idx:end_idx] += vol_curve[:actual_len]
-            counts[start_idx:end_idx] += 1
+                mask_logits_batch = outputs["mask_logits"] # (B, 1, clip_len, H, W)
+                
+                vol_curve_batch = None
+                if "volume" in outputs and outputs["volume"] is not None:
+                    vol_curve_batch = outputs["volume"]
+                    if vol_curve_batch.dim() == 3:
+                        vol_curve_batch = vol_curve_batch.squeeze(-1) # (B, clip_len)
+                
+                for i, (s, e, a_len) in enumerate(pending_indices):
+                    mask_logits = mask_logits_batch[i:i+1] # (1, 1, clip_len, H, W)
+                    
+                    if vol_curve_batch is not None:
+                        vol_curve = vol_curve_batch[i:i+1] # (1, clip_len)
+                    else:
+                        vol_curve = _compute_vol_curve(mask_logits) # (1, clip_len)
+                    
+                    if mask_logits.shape[2:] != (clip_len, H, W):
+                        mask_logits = F.interpolate(mask_logits, size=(clip_len, H, W), mode='trilinear', align_corners=False)
+                    mask_logits = mask_logits.squeeze(0).squeeze(0) # (clip_len, H, W)
+                    
+                    vol_curve = vol_curve.unsqueeze(0) # (1, 1, clip_len)
+                    if vol_curve.shape[2] != clip_len:
+                        vol_curve = F.interpolate(vol_curve, size=clip_len, mode='linear', align_corners=False)
+                    vol_curve = vol_curve.squeeze(0).squeeze(0) # (clip_len,)
+                    
+                    full_mask_logits[s:e] += mask_logits[:a_len]
+                    full_vol_curve[s:e] += vol_curve[:a_len]
+                    counts[s:e] += 1
+                
+                pending_chunks = []
+                pending_indices = []
 
     full_mask_logits = full_mask_logits / counts.unsqueeze(-1).unsqueeze(-1)
     full_vol_curve = full_vol_curve / counts

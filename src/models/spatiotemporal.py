@@ -130,7 +130,9 @@ class SpatiotemporalEchoModel(nn.Module):
         self.decoder = SpatiotemporalDecoder(in_channels=self.shared_channels, out_channels=num_classes)
         
         self.c_head = nn.Linear(self.shared_channels, 1)
-        nn.init.constant_(self.c_head.bias, 1.15)
+        # Initialize bias to offset the normalized pixel magnitudes (A_norm~0.1 -> ln(A)~-2.3, L_norm~0.5 -> ln(L)~-0.7)
+        # V ~ 100 mL -> ln(V) ~ 4.6. Thus ln(c) = 4.6 - 1.5(-2.3) - 0.5(-0.7) ~ 8.4.
+        nn.init.constant_(self.c_head.bias, 8.4)
         self.gamma = nn.Parameter(torch.tensor(1.5))
         self.beta = nn.Parameter(torch.tensor(0.5))
 
@@ -183,17 +185,24 @@ class SpatiotemporalEchoModel(nn.Module):
         spatial_pooled = spatial_pooled.permute(0, 2, 1) # (B, T, C)
         ln_c_t = self.c_head(spatial_pooled)             # (B, T, 1)
 
-        probs = torch.sigmoid(mask_logits)               # (B, 1, T, H, W)
+        # Match temporal dimension if decoder upsampled time
+        T_out = mask_logits.shape[2]
+        if ln_c_t.shape[1] != T_out:
+            ln_c_t = ln_c_t.permute(0, 2, 1) # (B, 1, T)
+            ln_c_t = F.interpolate(ln_c_t, size=T_out, mode='linear', align_corners=False)
+            ln_c_t = ln_c_t.permute(0, 2, 1) # (B, T_out, 1)
 
-        # Raw Pixel Area
-        A_raw = probs.sum(dim=(-2, -1))                  # (B, 1, T)
-        A_raw = torch.clamp(A_raw, min=1e-3)
-        A_raw = A_raw.permute(0, 2, 1)                   # (B, T, 1)
-        
-        # Differential Long Axis Length (L) using spatial covariance
+        probs = torch.sigmoid(mask_logits)               # (B, 1, T, H, W)
         B, C, T, H, W = probs.shape
-        y = torch.arange(H, device=probs.device, dtype=probs.dtype)
-        x = torch.arange(W, device=probs.device, dtype=probs.dtype)
+
+        # Normalized Pixel Area by Image Shape
+        A_norm = probs.sum(dim=(-2, -1)) / (H * W)
+        A_norm = torch.clamp(A_norm, min=1e-6)
+        A_norm = A_norm.permute(0, 2, 1)                 # (B, T, 1)
+        
+        # Differential Long Axis Length (L) using normalized spatial covariance
+        y = torch.arange(H, device=probs.device, dtype=probs.dtype) / H
+        x = torch.arange(W, device=probs.device, dtype=probs.dtype) / W
         grid_y, grid_x = torch.meshgrid(y, x, indexing='ij')
         
         grid_x = grid_x.view(1, 1, 1, H, W)
@@ -207,23 +216,24 @@ class SpatiotemporalEchoModel(nn.Module):
         M_yy = (probs * (grid_y - mu_y)**2).sum(dim=(-2, -1)) / A_sum.squeeze(-1).squeeze(-1)
         M_xy = (probs * (grid_x - mu_x) * (grid_y - mu_y)).sum(dim=(-2, -1)) / A_sum.squeeze(-1).squeeze(-1)
         
-        eps_val = 1e-3
+        eps_val = 1e-6
         trace_half = (M_xx + M_yy) / 2.0
         gap_half = (M_xx - M_yy) / 2.0
         lambda_1 = trace_half + torch.sqrt(gap_half**2 + M_xy**2 + eps_val)
         
-        L_raw = torch.sqrt(lambda_1 + eps_val)           # (B, 1, T)
-        L_raw = L_raw.permute(0, 2, 1)                   # (B, T, 1)
+        # Normalized Length
+        L_norm = torch.sqrt(lambda_1 + eps_val)          # (B, 1, T)
+        L_norm = L_norm.permute(0, 2, 1)                 # (B, T, 1)
 
-        ln_A = torch.log(A_raw)
-        ln_L = torch.log(L_raw)
+        ln_A = torch.log(A_norm)
+        ln_L = torch.log(L_norm)
         
         ln_V = ln_c_t + self.gamma * ln_A + self.beta * ln_L
         V = torch.exp(ln_V)
 
         return {
             "mask_logits": mask_logits,
-            "volume": V.squeeze(-1),
+            "volume": V,
             "vol_curve": V.squeeze(-1),
             "ln_vol_curve": ln_V.squeeze(-1),
             "router_weights": None
